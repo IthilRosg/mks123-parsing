@@ -114,9 +114,13 @@ def parse_yml(
         source_data = handle.read(max_bytes + 1)
     if len(source_data) > max_bytes:
         raise FeedValidationError(f"source size exceeds byte limit: {max_bytes}")
-    root = ET.fromstring(source_data)
+    try:
+        root = ET.fromstring(source_data)
+    except ET.ParseError as exc:
+        raise FeedValidationError(f"invalid XML feed: {exc}") from exc
     if root.tag != "yml_catalog":
         raise FeedValidationError(f"invalid root element: {root.tag!r}")
+
     shops = root.findall("shop")
     if len(shops) != 1:
         raise FeedValidationError(f"expected exactly one shop element, found {len(shops)}")

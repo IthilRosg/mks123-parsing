@@ -275,7 +275,12 @@ def snapshot_target(
     return target
 
 
-def _install_metadata(target: Path, content_hash: str, metadata: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _install_metadata(
+    target: Path,
+    content_hash: str,
+    metadata: dict[str, Any],
+    required_existing_metadata: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any]]:
     metadata_path = target.with_suffix(".metadata.json")
     required = {**metadata, "local_file": target.name, "sha256": content_hash}
     expected = (json.dumps(required, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -288,6 +293,9 @@ def _install_metadata(target: Path, content_hash: str, metadata: dict[str, Any])
         raise RuntimeError(f"invalid snapshot metadata: {metadata_path.name}") from exc
     if existing.get("local_file") != target.name or existing.get("sha256") != required["sha256"]:
         raise RuntimeError(f"snapshot metadata identity mismatch: {metadata_path.name}")
+    for key, expected_value in (required_existing_metadata or {}).items():
+        if existing.get(key) != expected_value:
+            raise RuntimeError(f"snapshot metadata conflict for {key}: {metadata_path.name}")
     return False, existing
 
 
@@ -298,6 +306,7 @@ def install_snapshot(
     feed_date: str,
     content_hash: str,
     metadata: dict[str, Any],
+    required_existing_metadata: dict[str, Any] | None = None,
 ) -> SnapshotInstallResult:
     part = Path(part)
     root = Path(root).resolve()
@@ -318,7 +327,12 @@ def install_snapshot(
             installed_data = source_data if created else _read_existing_exclusive_readonly(target)
             if hashlib.sha256(installed_data).hexdigest() != content_hash:
                 raise RuntimeError(f"immutable snapshot hash mismatch: {target.name}")
-            metadata_created, stored_metadata = _install_metadata(target, content_hash, metadata)
+            metadata_created, stored_metadata = _install_metadata(
+                target,
+                content_hash,
+                metadata,
+                required_existing_metadata,
+            )
             return SnapshotInstallResult(
                 target=target,
                 created=created,

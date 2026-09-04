@@ -61,6 +61,17 @@ Then obtain and validate an immutable local snapshot without touching the produc
 
 The connector exits fail-closed on missing credentials, authentication/network errors, redirects, HTML responses, oversized responses, malformed YML or an offer count outside the configured acceptance range.
 
+### Electrozone manual drop
+
+Until official feed credentials are provisioned, import a supplier-provided file explicitly:
+
+```powershell
+uv run python scripts/import_manual_drop.py `
+  --source "D:\path\from-supplier\market_whs.yml"
+```
+
+The importer leaves the supplied file untouched, copies it through a size-bounded temporary file, verifies its hash and YML structure, and installs an immutable snapshot under `raw/` with `source=manual_drop`. It never invokes matching, publication, or a production database writer. The default acceptance floor is 1,500 offers; overriding it is intended only for tests or a separately approved supplier contract.
+
 ### Proposal generation
 
 ```bash
