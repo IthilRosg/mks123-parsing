@@ -1,0 +1,41 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.secret
+credentials/
+
+# Supplier and catalog data
+raw/
+inbound/
+runs/
+state/
+verification/
+*.duckdb
+*.duckdb.wal
+
+# Local operator scratch
+.ops-tmp/
+*.tmp
+*.part
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

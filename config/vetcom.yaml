@@ -1,0 +1,65 @@
+supplier:
+  id: vetcom
+  scope:
+    catalog_sku_prefix: "41"
+  source:
+    type: public_yml_catalog
+    url: "https://mks123.ru/pr/price_vetcom.xml"
+    raw_retention_days: 90
+    min_offer_count: 2000
+    max_offer_count: 100000
+    max_response_bytes: 67108864
+matching:
+  order:
+    - exact_catalog_sku
+    - unique_ean
+    - unique_manufacturer_model
+  auto_price_eligible_statuses:
+    - exact
+  fuzzy_name:
+    enabled: false
+pricing:
+  base_currency: RUB
+  vat_basis: included
+  vat_policy_approved: true
+  exchange_rates:
+    RUR:
+      rub_per_unit: 1
+      source: base_currency_parity
+    RUB:
+      rub_per_unit: 1
+      source: base_currency_parity
+  markup_policy:
+    approved: true
+    rules:
+      - id: supplier-price-plus-10
+        version: "2026-09-03"
+        multiplier: 1.10
+  rounding:
+    mode: exact
+    increment_rub: null
+  safety:
+    reject_nonpositive_source_price: true
+    reject_unknown_currency: true
+    reject_unknown_vat_basis: true
+    reject_non_exact_match: true
+    reject_missing_markup: true
+    max_delta_pct: 0.50
+    minimum_margin_pct: null
+stock:
+  source_field: available
+  missing_product_policy:
+    action: quarantine
+    consecutive_missing_runs: 3
+registry_enrichment:
+  enabled: false
+  required_for_catalog_ingestion: false
+  scope: PP-878
+  primary_evidence_required: true
+  category_name: "Реестровое оборудование"
+publication:
+  enabled: false
+  require_preview_approval: true
+  require_backup: true
+  require_three_readbacks: true
+  rollback_required: true
