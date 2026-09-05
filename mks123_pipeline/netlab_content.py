@@ -50,6 +50,7 @@ class _SafeHtmlParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self._blocked_depth = 0
+        self._open_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         del attrs
@@ -63,6 +64,8 @@ class _SafeHtmlParser(HTMLParser):
             return
         if tag in _ALLOWED_TAGS:
             self.parts.append(f"<{tag}>")
+            if tag not in _VOID_TAGS:
+                self._open_tags.append(tag)
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -75,8 +78,13 @@ class _SafeHtmlParser(HTMLParser):
             if tag in _BLOCKED_TAGS:
                 self._blocked_depth = max(0, self._blocked_depth - 1)
             return
-        if tag in _ALLOWED_TAGS and tag not in _VOID_TAGS:
-            self.parts.append(f"</{tag}>")
+        if tag not in _ALLOWED_TAGS or tag in _VOID_TAGS or tag not in self._open_tags:
+            return
+        while self._open_tags:
+            open_tag = self._open_tags.pop()
+            self.parts.append(f"</{open_tag}>")
+            if open_tag == tag:
+                break
 
     def handle_data(self, data: str) -> None:
         if not self._blocked_depth:
@@ -84,6 +92,12 @@ class _SafeHtmlParser(HTMLParser):
 
     def handle_comment(self, data: str) -> None:
         del data
+
+    def finish(self) -> None:
+        if self._blocked_depth:
+            raise ValueError("blocked Netlab HTML tag is not closed")
+        while self._open_tags:
+            self.parts.append(f"</{self._open_tags.pop()}>")
 
 
 def sanitize_supplier_html(value: str, *, max_chars: int = 256_000) -> str:
@@ -95,6 +109,7 @@ def sanitize_supplier_html(value: str, *, max_chars: int = 256_000) -> str:
     try:
         parser.feed(value)
         parser.close()
+        parser.finish()
     except ValueError as exc:
         raise FeedValidationError("invalid Netlab description HTML") from exc
     result = re.sub(r"[ \t]{2,}", " ", "".join(parser.parts).strip())
@@ -106,15 +121,17 @@ def sanitize_supplier_html(value: str, *, max_chars: int = 256_000) -> str:
 def _safe_image_url(value: str) -> bool:
     try:
         parsed = urlsplit(value)
-    except ValueError:
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
         return False
     return (
         parsed.scheme.casefold() == "https"
-        and parsed.hostname is not None
-        and parsed.hostname.casefold() == _ALLOWED_IMAGE_HOST
+        and hostname is not None
+        and hostname.casefold() == _ALLOWED_IMAGE_HOST
         and parsed.username is None
         and parsed.password is None
-        and parsed.port in {None, 443}
+        and port in {None, 443}
         and bool(parsed.path)
         and not parsed.fragment
     )
@@ -201,8 +218,11 @@ def enrich_netlab_snapshot(
         property_data = properties_by_uid.get(uid) if uid_joinable and uid is not None else None
         records, description_html = property_data if property_data is not None else ([], None)
         description = sanitize_supplier_html(description_html) if description_html is not None else None
-        if description_html is not None:
+        if description == "":
+            description = None
+        if description is not None:
             description_count += 1
+        description_sanitized_empty = description_html is not None and description is None
         safe_images = [url for url in item.image_urls if _safe_image_url(url)]
         invalid_images = [url for url in item.image_urls if not _safe_image_url(url)]
         invalid_image_count += len(invalid_images)
@@ -210,6 +230,7 @@ def enrich_netlab_snapshot(
             item.supplier_item_id in invalid_uid_supplier_ids
             or uid in duplicate_uids
             or property_data is None and uid is not None
+            or description_sanitized_empty
             or bool(invalid_images)
             or any(bool(record["definition_missing"]) for record in records)
         )
@@ -256,7 +277,7 @@ def enrich_netlab_snapshot(
             item.model_copy(
                 update={
                     "description": description,
-                    "description_html": description_html,
+                    "description_html": description,
                     "properties": records,
                     "content_provenance": provenance,
                     "image_urls": safe_images,

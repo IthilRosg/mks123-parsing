@@ -8,6 +8,7 @@ dependencies = [
     "defusedxml>=0.7.1,<1",
     "duckdb==1.5.5",
     "fsspec>=2025.7.0,<2027",
+    "pandas==2.3.3",
     "pydantic==2.13.5",
     "pyyaml==6.0.3",
 ]
@@ -28,6 +29,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

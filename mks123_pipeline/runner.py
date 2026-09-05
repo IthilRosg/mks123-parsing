@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import msvcrt
 import os
 import re
 import shutil
@@ -18,7 +17,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 import duckdb
+import pandas as pd
 
 from .adapters import ElectrozoneAdapter, SupplierAdapter
 from .category_mapping import build_category_mapping
@@ -87,29 +92,39 @@ def _quote_duckdb_identifier(value: str) -> str:
     return f'"{value}"'
 
 
+def _duckdb_text_value(value: Any) -> str:
+    normalized = _csv_value(value)
+    return "" if normalized is None else str(normalized)
+
+
 def _write_duckdb(
     database: Path,
     specifications: list[tuple[str, list[str], list[dict[str, Any]]]],
 ) -> None:
-    memory_only_config = {**DUCKDB_SAFE_CONFIG, "enable_external_access": "true"}
-    with duckdb.connect(str(database), config=memory_only_config) as db:
-        db.execute("SET allowed_directories = []")
-        for table_name, fieldnames, rows in specifications:
-            _quote_duckdb_identifier(table_name)
-            buffer = io.StringIO(newline="")
-            writer = csv.DictWriter(
-                buffer,
-                fieldnames=fieldnames,
-                extrasaction="ignore",
-                lineterminator="\n",
+    with duckdb.connect(str(database), config=DUCKDB_SAFE_CONFIG) as db:
+        for index, (table_name, fieldnames, rows) in enumerate(specifications):
+            table_identifier = _quote_duckdb_identifier(table_name)
+            column_identifiers = [_quote_duckdb_identifier(name) for name in fieldnames]
+            if not column_identifiers:
+                raise ValueError("DuckDB table must have at least one column")
+            if not rows:
+                columns_sql = ", ".join(f"{name} VARCHAR" for name in column_identifiers)
+                db.execute(f"CREATE TABLE {table_identifier} ({columns_sql})")
+                continue
+            dataframe = pd.DataFrame(
+                {
+                    name: [_duckdb_text_value(row.get(name)) for row in rows]
+                    for name in fieldnames
+                },
+                columns=fieldnames,
             )
-            writer.writeheader()
-            writer.writerows(
-                {name: _csv_value(row.get(name)) for name in fieldnames} for row in rows
-            )
-            buffer.seek(0)
-            relation = db.read_csv(buffer, header=True, all_varchar=True)
-            relation.to_table(table_name)
+            view_name = f"_netlab_materialization_{index}"
+            view_identifier = _quote_duckdb_identifier(view_name)
+            db.register(view_name, dataframe)
+            try:
+                db.execute(f"CREATE TABLE {table_identifier} AS SELECT * FROM {view_identifier}")
+            finally:
+                db.unregister(view_name)
         db.execute("SET enable_external_access = 'false'")
 
 
@@ -124,19 +139,33 @@ def _run_reservation(lock_path: Path, timeout: float = 30.0):
         raise TimeoutError(f"timed out waiting for run reservation: {lock_path.name}")
     try:
         with lock_path.open("a+b") as handle:
-            if handle.seek(0, os.SEEK_END) == 0:
-                handle.write(b"\0")
-                handle.flush()
-                os.fsync(handle.fileno())
-            while True:
-                try:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time_module.monotonic() >= deadline:
-                        raise TimeoutError(f"timed out waiting for run reservation: {lock_path.name}")
-                    time_module.sleep(0.02)
+            if os.name == "nt":
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if time_module.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for run reservation: {lock_path.name}"
+                            ) from exc
+                        time_module.sleep(0.02)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if time_module.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for run reservation: {lock_path.name}"
+                            ) from exc
+                        time_module.sleep(0.02)
             try:
                 handle.seek(0)
                 handle.truncate()
@@ -145,8 +174,11 @@ def _run_reservation(lock_path: Path, timeout: float = 30.0):
                 os.fsync(handle.fileno())
                 yield
             finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         thread_lock.release()
 
@@ -305,6 +337,7 @@ def _build_pilot(
     previous_state_path: str | Path | None = None,
     missing_product_action: str | None = None,
     consecutive_missing_runs: int | None = None,
+    seal_canonical_root: str | Path | None = None,
 ) -> dict[str, Any]:
     source_path = Path(source_path)
     catalog_csv = Path(catalog_csv)
@@ -667,7 +700,7 @@ def _build_pilot(
         summary=summary,
     )
     write_run_manifest(output_dir / "run-manifest.json", manifest)
-    build_run_seal(output_dir)
+    build_run_seal(output_dir, canonical_path_root=seal_canonical_root)
     return summary
 
 
@@ -725,6 +758,7 @@ def run_pilot(
                 previous_state_path=previous_state_path,
                 missing_product_action=missing_product_action,
                 consecutive_missing_runs=consecutive_missing_runs,
+                seal_canonical_root=output_dir,
             )
             try:
                 os.rename(staging, output_dir)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from datetime import datetime
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -52,6 +54,15 @@ PRICE_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
 PROPERTIES_XML = b'''<?xml version="1.0" encoding="UTF-8"?>
 <xml_catalog date="2026-09-04 08:46"><properties><property id="p1">Vendor</property></properties>
 <items><item id="1000463"><p1>Rexant</p1></item></items></xml_catalog>'''
+
+
+def _freeze_fetch_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 5, 6, 0, tzinfo=tz)
+
+    monkeypatch.setattr(fetch, "datetime", FrozenDateTime)
 
 
 class _Headers:
@@ -189,6 +200,7 @@ def test_netlab_price_fetch_installs_parseable_immutable_zip(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _freeze_fetch_clock(monkeypatch)
     body = _archive("Price.xml", PRICE_XML)
 
     def write_price(url: str, part: Path, **validators) -> fetch.DownloadResult:
@@ -260,11 +272,32 @@ def test_netlab_properties_fetch_validates_before_install(
     assert result["production_writes"] == 0
 
 
+def test_validated_snapshot_rejects_hard_link_entry(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    snapshot = raw_root / "snapshot.zip"
+    payload = b"accepted snapshot"
+    snapshot.write_bytes(payload)
+    try:
+        os.link(snapshot, raw_root / "alias.zip")
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable: {exc}")
+
+    metadata = {
+        "local_file": snapshot.name,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+    with pytest.raises(ValueError, match="hard-link"):
+        fetch._validated_snapshot_path(raw_root, metadata)
+
+
 def test_price_fetch_reuses_verified_snapshot_on_conditional_304(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _freeze_fetch_clock(monkeypatch)
     body = _archive("Price.xml", PRICE_XML)
     digest = hashlib.sha256(body).hexdigest()
     responses = [
@@ -329,6 +362,7 @@ def test_price_fetch_reparses_304_snapshot_and_retries_when_sidecar_semantics_di
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _freeze_fetch_clock(monkeypatch)
     body = _archive("Price.xml", PRICE_XML)
     digest = hashlib.sha256(body).hexdigest()
     responses = [200, 304, 200]

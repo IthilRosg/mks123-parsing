@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -21,6 +22,29 @@ def test_evidence_hash_and_content_come_from_one_read(tmp_path: Path) -> None:
     assert evidence.sha256 == hashlib.sha256(b"original bytes").hexdigest()
 
 
+def test_read_evidence_rejects_data_over_limit(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"12345")
+
+    for invalid_limit in (True, False):
+        with pytest.raises(ValueError, match="max_bytes"):
+            read_evidence(source, max_bytes=invalid_limit)
+
+    with pytest.raises(ValueError, match="max_bytes"):
+        read_evidence(source, max_bytes=4)
+
+
+def test_read_evidence_identity_only_skips_content_hash(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"identity-only")
+
+    evidence = read_evidence(source, calculate_hash=False, read_content=False)
+
+    assert evidence.data == b""
+    assert evidence.sha256 == ""
+    assert evidence.file_identity
+
+
 def test_read_evidence_rejects_hard_link_entries(tmp_path: Path) -> None:
     source = tmp_path / "source.bin"
     linked = tmp_path / "linked.bin"
@@ -29,6 +53,32 @@ def test_read_evidence_rejects_hard_link_entries(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="hard-link"):
         read_evidence(linked)
+
+
+def test_read_evidence_rejects_symlinked_parent(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    target = real_parent / "source.bin"
+    target.write_bytes(b"immutable")
+    symlink_parent = tmp_path / "parent-link"
+    try:
+        symlink_parent.symlink_to(real_parent, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises((OSError, ValueError)):
+        read_evidence(symlink_parent / "source.bin")
+
+
+def test_non_following_open_binds_parent_during_read() -> None:
+    opener = inspect.getsource(integrity._open_non_following)
+    posix_opener = inspect.getsource(integrity._open_posix_non_following)
+    reader = inspect.getsource(integrity.read_evidence)
+    assert "_open_posix_non_following" in opener
+    assert "dir_fd=" in posix_opener
+    assert "O_NOFOLLOW" in posix_opener
+    assert "parent_handles" in opener
+    assert "_close_parent_handles(parent_handles)" in reader
 
 
 def test_run_seal_rejects_added_or_modified_files(tmp_path: Path) -> None:
@@ -57,8 +107,8 @@ def test_seal_records_exact_file_hashes_and_sizes(tmp_path: Path) -> None:
     artifact = run / "artifact.bin"
     artifact.write_bytes(payload)
 
-    identity = read_evidence(artifact).file_identity
-    canonical_path = "artifact.bin"
+    evidence = read_evidence(artifact)
+    parent_canonical_path = integrity._normalized_physical_path(Path(evidence.canonical_path).parent)
     build_run_seal(run)
     stored = json.loads((run / "seal.json").read_text(encoding="utf-8"))
 
@@ -66,10 +116,45 @@ def test_seal_records_exact_file_hashes_and_sizes(tmp_path: Path) -> None:
         "artifact.bin": {
             "sha256": hashlib.sha256(payload).hexdigest(),
             "size": len(payload),
-            "file_identity": list(identity),
-            "canonical_path": canonical_path,
+            "file_identity": list(evidence.file_identity),
+            "canonical_path": evidence.canonical_path,
+            "canonical_parent_path": parent_canonical_path,
         }
     }
+
+
+def test_load_sealed_run_rejects_relative_canonical_path_binding(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    artifact = run / "artifact.bin"
+    artifact.write_bytes(b"artifact")
+    build_run_seal(run)
+
+    seal_path = run / "seal.json"
+    seal_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["files"]["artifact.bin"]["canonical_path"] = "artifact.bin"
+    seal_path.write_text(json.dumps(seal, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical path"):
+        verify_run_seal(run)
+
+
+def test_load_sealed_run_rejects_parent_path_binding_mismatch(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    artifact = run / "artifact.bin"
+    artifact.write_bytes(b"artifact")
+    build_run_seal(run)
+
+    seal_path = run / "seal.json"
+    seal_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["files"]["artifact.bin"]["canonical_parent_path"] = "wrong-parent"
+    seal_path.write_text(json.dumps(seal, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="parent path"):
+        verify_run_seal(run)
 
 
 def test_load_sealed_run_rejects_artifact_changed_after_capture(

@@ -1,5 +1,7 @@
 import hashlib
+import inspect
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +17,13 @@ def _part(root: Path, name: str, payload: bytes = b"<yml_catalog />") -> Path:
     path = root / name
     path.write_bytes(payload)
     return path
+
+
+def test_snapshot_store_has_platform_specific_paths() -> None:
+    source = inspect.getsource(snapshot_store)
+    assert "if os.name == \"nt\":" in source
+    assert "_publish_posix_exclusive_readonly" in source
+    assert "fcntl.flock" in source
 
 
 def test_snapshot_target_rejects_untrusted_feed_date_path_traversal(tmp_path: Path) -> None:
@@ -140,6 +149,7 @@ def test_snapshot_publication_uses_no_hardlink_alias(
     assert list(tmp_path.glob(".snapshot-stage-*.part")) == []
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows kernel32 handle semantics")
 def test_final_snapshot_name_rejects_a_second_writer_during_readback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -184,6 +194,7 @@ def test_final_snapshot_name_rejects_a_second_writer_during_readback(
     assert checked is True
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows kernel32 handle semantics")
 def test_target_publish_readback_failure_removes_new_snapshot_and_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -239,6 +250,7 @@ def test_published_manifest_is_readonly_and_uses_no_hardlink_alias(
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["sha256"] == installed.metadata["sha256"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows kernel32 handle semantics")
 def test_partial_manifest_write_leaves_no_temporary_or_published_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

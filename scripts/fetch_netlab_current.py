@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -20,6 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from mks123_pipeline.adapters import NetlabAdapter
 from mks123_pipeline.electrozone import FeedValidationError
+from mks123_pipeline.integrity import read_evidence
 from mks123_pipeline.netlab_properties import scan_netlab_properties
 from mks123_pipeline.snapshot_store import install_snapshot
 
@@ -171,19 +171,17 @@ def _fetch_to_part(url: str, part: Path) -> tuple[str, int, str]:
     return result.sha256, result.size, result.content_type
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _snapshot_contract(raw_root: Path, metadata: dict[str, object]) -> tuple[Path, str, int]:
     local_file = metadata.get("local_file")
     expected_hash = metadata.get("sha256")
     expected_size = metadata.get("size_bytes")
-    if not isinstance(local_file, str) or Path(local_file).name != local_file:
+    if (
+        not isinstance(local_file, str)
+        or not local_file
+        or Path(local_file).name != local_file
+        or "/" in local_file
+        or "\\" in local_file
+    ):
         raise ValueError("invalid accepted snapshot filename")
     if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
         raise ValueError("invalid accepted snapshot hash")
@@ -207,31 +205,9 @@ def _capture_validated_price_snapshot(
     snapshot_path, expected_hash, expected_size = _snapshot_contract(raw_root, metadata)
     if expected_size > MAX_SOURCE_BYTES:
         raise ValueError("accepted snapshot exceeds byte limit")
-    path_stat = snapshot_path.lstat()
-    if not stat.S_ISREG(path_stat.st_mode) or snapshot_path.is_symlink():
-        raise ValueError("accepted snapshot is not a regular file")
-    with snapshot_path.open("rb") as handle:
-        opened_stat = os.fstat(handle.fileno())
-        identity_before = (
-            opened_stat.st_dev,
-            opened_stat.st_ino,
-            opened_stat.st_size,
-            opened_stat.st_mtime_ns,
-        )
-        path_identity = (path_stat.st_dev, path_stat.st_ino, path_stat.st_size, path_stat.st_mtime_ns)
-        if identity_before != path_identity:
-            raise ValueError("accepted snapshot changed while opening")
-        data = handle.read(expected_size + 1)
-        opened_after = os.fstat(handle.fileno())
-        identity_after = (
-            opened_after.st_dev,
-            opened_after.st_ino,
-            opened_after.st_size,
-            opened_after.st_mtime_ns,
-        )
-    if identity_after != identity_before or len(data) != expected_size:
-        raise ValueError("accepted snapshot changed while capturing")
-    if hashlib.sha256(data).hexdigest() != expected_hash:
+    evidence = read_evidence(snapshot_path, max_bytes=MAX_SOURCE_BYTES)
+    data = evidence.data
+    if len(data) != expected_size or evidence.sha256 != expected_hash:
         raise ValueError("accepted snapshot failed size/hash validation")
     with captured_path.open("xb") as handle:
         handle.write(data)
@@ -257,19 +233,21 @@ def _capture_validated_price_snapshot(
 
 def _validated_snapshot_path(raw_root: Path, metadata: dict[str, object]) -> Path:
     snapshot, expected_hash, expected_size = _snapshot_contract(raw_root, metadata)
-    resolved = snapshot.resolve(strict=True)
-    if resolved.parent != raw_root:
-        raise ValueError("accepted snapshot escapes raw root")
-    if resolved.stat().st_size != expected_size or _sha256_file(resolved) != expected_hash:
+    if expected_size > MAX_SOURCE_BYTES:
+        raise ValueError("accepted snapshot exceeds byte limit")
+    evidence = read_evidence(snapshot, max_bytes=MAX_SOURCE_BYTES)
+    if len(evidence.data) != expected_size or evidence.sha256 != expected_hash:
         raise ValueError("accepted snapshot failed size/hash validation")
-    return resolved
+    return snapshot
 
 
 def _latest_price_metadata(raw_root: Path) -> dict[str, object] | None:
     accepted: list[dict[str, object]] = []
     for path in raw_root.glob("netlab-live-*.metadata.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(
+                read_evidence(path, max_bytes=4 * 1024 * 1024).data.decode("utf-8")
+            )
             if not isinstance(payload, dict):
                 continue
             if (

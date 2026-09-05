@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,26 @@ def _parse_timestamp(value: Any, label: str) -> datetime:
         raise ValueError(f"Netlab acquisition metadata {label} is invalid") from exc
     if parsed.tzinfo is None:
         raise ValueError(f"Netlab acquisition metadata {label} has no timezone")
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"Netlab acquisition metadata {label} is not UTC")
     return parsed
+
+
+def _require_int(payload: dict[str, Any], field: str) -> int:
+    value = payload.get(field)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Netlab acquisition metadata {field} is not an integer")  # noqa: TRY004
+    return value
+
+
+def _expected_feed_age_seconds(catalog_date: str, fetched_at: datetime) -> float:
+    try:
+        source_time = datetime.strptime(catalog_date, "%Y-%m-%d %H:%M").replace(
+            tzinfo=timezone(timedelta(hours=3), name="Europe/Moscow")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Netlab acquisition metadata feed date is invalid") from exc
+    return (fetched_at.astimezone(UTC) - source_time.astimezone(UTC)).total_seconds()
 
 
 def validate_netlab_acquisition_metadata(
@@ -68,11 +87,11 @@ def validate_netlab_acquisition_metadata(
         raise ValueError("Netlab acquisition metadata supplier/feed kind mismatch")
     if payload["source"] != "direct_https" or payload["source_url"] != DEFAULT_PRICE_URL:
         raise ValueError("Netlab acquisition metadata source is not allowlisted")
-    if payload["http_status"] != 200:
+    if _require_int(payload, "http_status") != 200:
         raise ValueError("Netlab acquisition metadata must describe HTTP 200")
     if payload["credentials_persisted"] is not False:
         raise ValueError("Netlab acquisition metadata records persisted credentials")
-    if payload["publication_enabled"] is not False or payload["production_writes"] != 0:
+    if payload["publication_enabled"] is not False or _require_int(payload, "production_writes") != 0:
         raise ValueError("Netlab acquisition metadata permits production writes")
 
     fetched_at = _parse_timestamp(payload["fetched_at_utc"], "fetched_at_utc")
@@ -109,7 +128,9 @@ def validate_netlab_acquisition_metadata(
 
     if payload["feed_catalog_date"] != expected_catalog_date:
         raise ValueError("Netlab acquisition metadata feed date does not match ZIP")
-    if payload["item_count"] != expected_item_count:
+    if not isinstance(expected_catalog_date, str):
+        raise ValueError("Netlab acquisition metadata feed date is invalid")  # noqa: TRY004
+    if _require_int(payload, "item_count") != expected_item_count:
         raise ValueError("Netlab acquisition metadata item count does not match ZIP")
     expected_rates = {key: str(value) for key, value in sorted(expected_currency_rates.items())}
     if payload["currency_rates"] != expected_rates:
@@ -119,9 +140,15 @@ def validate_netlab_acquisition_metadata(
     if not isinstance(max_age, int) or isinstance(max_age, bool) or not 1 <= max_age <= 24:
         raise ValueError("Netlab acquisition metadata max age is invalid")
     try:
-        age_seconds = float(payload["feed_age_seconds"])
+        age_seconds_value = payload["feed_age_seconds"]
+        if isinstance(age_seconds_value, bool):
+            raise TypeError
+        age_seconds = float(age_seconds_value)
     except (TypeError, ValueError) as exc:
         raise ValueError("Netlab acquisition metadata feed age is invalid") from exc
+    expected_age_seconds = _expected_feed_age_seconds(expected_catalog_date, fetched_at)
+    if not math.isclose(age_seconds, expected_age_seconds, rel_tol=0.0, abs_tol=0.001):
+        raise ValueError("Netlab acquisition metadata feed age does not match timestamps")
     if not math.isfinite(age_seconds) or age_seconds < -900 or age_seconds > max_age * 3600:
         raise ValueError("Netlab acquisition metadata feed age is outside the contract")
     try:
@@ -161,6 +188,7 @@ def validate_netlab_properties_acquisition_metadata(
         "item_count",
         "property_count",
         "observation_count",
+        "missing_observation_count",
         "unknown_property_id_count",
         "unknown_observation_count",
         "credentials_persisted",
@@ -178,11 +206,11 @@ def validate_netlab_properties_acquisition_metadata(
         raise ValueError("Netlab properties acquisition metadata supplier/feed kind mismatch")
     if payload["source"] != "direct_https" or payload["source_url"] != DEFAULT_PROPERTIES_URL:
         raise ValueError("Netlab properties acquisition metadata source is not allowlisted")
-    if payload["http_status"] != 200:
+    if _require_int(payload, "http_status") != 200:
         raise ValueError("Netlab properties acquisition metadata must describe HTTP 200")
     if payload["credentials_persisted"] is not False:
         raise ValueError("Netlab properties acquisition metadata records persisted credentials")
-    if payload["publication_enabled"] is not False or payload["production_writes"] != 0:
+    if payload["publication_enabled"] is not False or _require_int(payload, "production_writes") != 0:
         raise ValueError("Netlab properties acquisition metadata permits production writes")
     if _parse_timestamp(payload["fetched_at_utc"], "fetched_at_utc") != _parse_timestamp(
         expected_fetched_at, "expected fetched_at"
@@ -205,9 +233,13 @@ def validate_netlab_properties_acquisition_metadata(
         raise ValueError("Netlab properties acquisition metadata source hash is invalid")
     if source_hash != hashlib.sha256(source_data).hexdigest():
         raise ValueError("Netlab properties acquisition metadata source hash does not match ZIP")
-    if payload["size_bytes"] != len(source_data):
+    size_bytes = payload["size_bytes"]
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 1:
+        raise ValueError("Netlab properties acquisition metadata size is invalid")
+    if size_bytes != len(source_data):
         raise ValueError("Netlab properties acquisition metadata size does not match ZIP")
-    if payload["content_type"].lower() not in _ALLOWED_CONTENT_TYPES:
+    content_type = payload["content_type"]
+    if not isinstance(content_type, str) or content_type.lower() not in _ALLOWED_CONTENT_TYPES:
         raise ValueError("Netlab properties acquisition metadata content type is not an accepted ZIP type")
     if payload["feed_catalog_date"] != expected_catalog_date:
         raise ValueError("Netlab properties acquisition metadata feed date does not match ZIP")
@@ -217,11 +249,10 @@ def validate_netlab_properties_acquisition_metadata(
         "observation_count": expected_stats.observation_count,
         "unknown_property_id_count": expected_stats.unknown_property_id_count,
         "unknown_observation_count": expected_stats.unknown_observation_count,
+        "missing_observation_count": expected_stats.missing_observation_count,
     }
-    if "missing_observation_count" in payload:
-        expected_fields["missing_observation_count"] = expected_stats.missing_observation_count
     for field, expected in expected_fields.items():
-        if payload[field] != expected:
+        if _require_int(payload, field) != expected:
             raise ValueError(f"Netlab properties acquisition metadata {field} does not match ZIP")
     if payload["max_feed_age_hours"] is not None or payload["feed_age_seconds"] is not None:
         raise ValueError("Netlab properties acquisition metadata has price-feed age fields")

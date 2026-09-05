@@ -11,12 +11,13 @@ permissions:
 
 jobs:
   quality:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     env:
       PYTHONPATH: .
     strategy:
       fail-fast: false
       matrix:
+        os: ["windows-latest", "ubuntu-latest"]
         python-version: ["3.11"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

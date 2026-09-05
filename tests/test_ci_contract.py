@@ -12,6 +12,7 @@ def test_github_ci_runs_locked_quality_and_repository_boundary_checks() -> None:
     assert payload["permissions"] == {"contents": "read"}
     job = payload["jobs"]["quality"]
     assert job["strategy"]["matrix"]["python-version"] == ["3.11"]
+    assert set(job["strategy"]["matrix"]["os"]) == {"windows-latest", "ubuntu-latest"}
     assert job["env"]["PYTHONPATH"] == "."
     steps = job["steps"]
     checkout = steps[0]

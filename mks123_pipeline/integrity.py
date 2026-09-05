@@ -95,6 +95,10 @@ def _normalized_physical_path(value: str | Path) -> str:
     return os.path.normcase(os.path.normpath(text))
 
 
+def _canonical_parent_path(canonical_path: str) -> str:
+    return _normalized_physical_path(Path(canonical_path).parent)
+
+
 def _canonical_path_from_fd(fd: int) -> str:
     if os.name == "nt":
         handle = msvcrt.get_osfhandle(fd)
@@ -162,10 +166,48 @@ def _close_windows_parent_directories(handles: list[int]) -> None:
             _KERNEL32.CloseHandle(handle)
 
 
-def _open_non_following(path: Path) -> int:
+def _close_parent_handles(handles: list[int]) -> None:
+    if os.name == "nt":
+        _close_windows_parent_directories(handles)
+        return
+    for handle in reversed(handles):
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+
+
+def _open_posix_non_following(path: Path) -> tuple[int, list[int]]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_handles: list[int] = []
+    try:
+        parent_fd = os.open(os.sep, directory_flags)
+        parent_handles.append(parent_fd)
+        for component in absolute.parts[1:-1]:
+            child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            parent_handles.append(child_fd)
+            parent_fd = child_fd
+        filename = absolute.parts[-1]
+        fd = os.open(
+            filename,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        return fd, parent_handles
+    except BaseException:
+        _close_parent_handles(parent_handles)
+        raise
+
+
+def _open_non_following(path: Path) -> tuple[int, list[int]]:
     if os.name != "nt":
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        return os.open(path, flags)
+        return _open_posix_non_following(path)
 
     parent_handles = _open_windows_parent_directories(path)
     handle = _INVALID_HANDLE_VALUE
@@ -196,11 +238,12 @@ def _open_non_following(path: Path) -> int:
             raise ValueError(f"evidence path is a directory: {path.name}")
         fd = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
         transferred = True
-        return fd
+        return fd, parent_handles
     finally:
-        if not transferred and handle != _INVALID_HANDLE_VALUE:
-            _KERNEL32.CloseHandle(handle)
-        _close_windows_parent_directories(parent_handles)
+        if not transferred:
+            if handle != _INVALID_HANDLE_VALUE:
+                _KERNEL32.CloseHandle(handle)
+            _close_windows_parent_directories(parent_handles)
 
 
 def _file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -219,14 +262,26 @@ def read_evidence(
     *,
     max_bytes: int | None = None,
     calculate_hash: bool = True,
+    read_content: bool = True,
 ) -> Evidence:
     source_path = Path(path)
-    if max_bytes is not None and (not isinstance(max_bytes, int) or max_bytes < 0):
+    if max_bytes is not None and (
+        not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0
+    ):
         raise ValueError("evidence max_bytes must be a non-negative integer")
+    if not read_content and max_bytes is not None:
+        raise ValueError("max_bytes cannot be used for identity-only evidence")
+    if not read_content and calculate_hash:
+        raise ValueError("calculate_hash requires content evidence")
     expected_canonical_path = _normalized_physical_path(source_path.resolve(strict=True))
     fd: int | None = None
+    parent_handles: list[int] = []
     try:
-        fd = _open_non_following(source_path)
+        opened = _open_non_following(source_path)
+        if isinstance(opened, tuple):
+            fd, parent_handles = opened
+        else:  # Backwards-compatible seam for tests and older internal callers.
+            fd = opened
         opened_canonical_path = _canonical_path_from_fd(fd)
         if opened_canonical_path != expected_canonical_path:
             raise ValueError(f"evidence canonical path changed: {source_path.name}")
@@ -237,8 +292,15 @@ def read_evidence(
             raise ValueError(f"evidence path is a hard-link entry: {source_path.name}")
         with os.fdopen(fd, "rb", closefd=True) as handle:
             fd = None
-            read_limit = max_bytes + 1 if max_bytes is not None else -1
-            data = handle.read(read_limit)
+            if read_content:
+                read_limit = max_bytes + 1 if max_bytes is not None else -1
+                data = handle.read(read_limit)
+                if max_bytes is not None and len(data) > max_bytes:
+                    raise ValueError(
+                        f"evidence exceeds byte limit (max_bytes): {source_path.name}"
+                    )
+            else:
+                data = b""
             after = os.fstat(handle.fileno())
         identity = _file_identity(before)
         if identity != _file_identity(after):
@@ -246,6 +308,7 @@ def read_evidence(
     finally:
         if fd is not None:
             os.close(fd)
+        _close_parent_handles(parent_handles)
     return Evidence(
         path=source_path,
         data=data,
@@ -292,19 +355,29 @@ def _assert_evidence_unchanged(path: Path, evidence: Evidence, label: str) -> No
         raise ValueError(f"sealed run file changed during verification: {label}")
 
 
-def build_run_seal(run_dir: str | Path) -> dict[str, Any]:
+def build_run_seal(
+    run_dir: str | Path,
+    *,
+    canonical_path_root: str | Path | None = None,
+) -> dict[str, Any]:
     run_dir = Path(run_dir)
+    canonical_root = Path(canonical_path_root) if canonical_path_root is not None else run_dir
     seal_path = run_dir / SEAL_NAME
     if seal_path.exists():
         raise FileExistsError(f"run seal already exists: {seal_path}")
     files: dict[str, dict[str, Any]] = {}
     for relative, path in sorted(_file_paths(run_dir).items()):
         evidence = read_evidence(path)
+        expected_staging_path = _normalized_physical_path(run_dir / Path(relative))
+        if evidence.canonical_path != expected_staging_path:
+            raise ValueError(f"sealed run canonical path changed during capture: {relative}")
+        sealed_canonical_path = _normalized_physical_path(canonical_root / Path(relative))
         files[relative] = {
             "sha256": evidence.sha256,
             "size": len(evidence.data),
             "file_identity": list(evidence.file_identity),
-            "canonical_path": relative,
+            "canonical_path": sealed_canonical_path,
+            "canonical_parent_path": _canonical_parent_path(sealed_canonical_path),
         }
     seal: dict[str, Any] = {"version": SEAL_VERSION, "files": files}
     payload = (json.dumps(seal, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -350,8 +423,10 @@ def load_sealed_run(run_dir: str | Path) -> SealedRunEvidence:
             or tuple(expected_identity) != evidence.file_identity
         ):
             raise ValueError(f"sealed run identity mismatch: {relative}")
-        if record.get("canonical_path") != relative:
+        if record.get("canonical_path") != evidence.canonical_path:
             raise ValueError(f"sealed run canonical path mismatch: {relative}")
+        if record.get("canonical_parent_path") != _canonical_parent_path(evidence.canonical_path):
+            raise ValueError(f"sealed run parent path mismatch: {relative}")
     if set(_file_paths(run_dir)) != expected:
         raise ValueError("sealed run file set changed during verification")
     _assert_evidence_unchanged(run_dir / SEAL_NAME, seal_evidence, SEAL_NAME)

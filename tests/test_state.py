@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from mks123_pipeline.runner import run_pilot
 from mks123_pipeline.state import update_missing_state
 
@@ -76,6 +78,36 @@ def test_complete_feed_advances_state_but_never_writes() -> None:
         "sku": "11-100",
         "consecutive_missing_runs": 3,
     }]
+
+
+def test_missing_state_rejects_boolean_counters_and_threshold() -> None:
+    previous = {
+        "schema_version": 1,
+        "supplier": "electrozone",
+        "products": {"100": {"sku": "11-100", "consecutive_missing_runs": True}},
+    }
+
+    with pytest.raises(ValueError, match="consecutive_missing_runs"):
+        update_missing_state(
+            previous,
+            supplier="electrozone",
+            run_id="run-2",
+            complete=False,
+            missing_products={},
+            action="quarantine",
+            threshold=3,
+        )
+
+    with pytest.raises(ValueError, match="threshold"):
+        update_missing_state(
+            None,
+            supplier="electrozone",
+            run_id="run-2",
+            complete=True,
+            missing_products={"100": "11-100"},
+            action="quarantine",
+            threshold=True,
+        )
 
 
 def test_runner_marks_partial_catalog_coverage_and_does_not_advance_state(tmp_path: Path) -> None:

@@ -51,6 +51,7 @@ def test_run_contains_self_contained_input_manifest(tmp_path: Path) -> None:
     assert "mks123_pipeline/legacy_xml.py" in code_files
     assert "mks123_pipeline/verifier.py" in code_files
     assert "fsspec" in manifest["code_identity"]["runtime"]["dependencies"]
+    assert "pandas" in manifest["code_identity"]["runtime"]["dependencies"]
     code_hash = manifest["code_identity"]["sha256"]
     assert f"-code-{code_hash[:12]}" in manifest["canonical_run_id"]
     assert manifest["summary"]["source_items"] == summary["source_items"]

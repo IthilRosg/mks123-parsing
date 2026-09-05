@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
-import msvcrt
 import os
 import re
 import threading
@@ -14,6 +13,11 @@ from dataclasses import dataclass
 from datetime import date, time
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from .integrity import read_evidence
 
@@ -35,7 +39,6 @@ _FILE_BASIC_INFO_CLASS = 0
 _ERROR_FILE_EXISTS = 80
 _ERROR_ALREADY_EXISTS = 183
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 class _FileBasicInfo(ctypes.Structure):
@@ -48,59 +51,67 @@ class _FileBasicInfo(ctypes.Structure):
     ]
 
 
-_KERNEL32.CreateFileW.argtypes = [
-    wintypes.LPCWSTR,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    wintypes.HANDLE,
-]
-_KERNEL32.CreateFileW.restype = wintypes.HANDLE
-_KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
-_KERNEL32.CloseHandle.restype = wintypes.BOOL
-_KERNEL32.WriteFile.argtypes = [
-    wintypes.HANDLE,
-    wintypes.LPCVOID,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-    wintypes.LPVOID,
-]
-_KERNEL32.WriteFile.restype = wintypes.BOOL
-_KERNEL32.ReadFile.argtypes = [
-    wintypes.HANDLE,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-    wintypes.LPVOID,
-]
-_KERNEL32.ReadFile.restype = wintypes.BOOL
-_KERNEL32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
-_KERNEL32.FlushFileBuffers.restype = wintypes.BOOL
-_KERNEL32.SetFilePointerEx.argtypes = [
-    wintypes.HANDLE,
-    ctypes.c_longlong,
-    ctypes.POINTER(ctypes.c_longlong),
-    wintypes.DWORD,
-]
-_KERNEL32.SetFilePointerEx.restype = wintypes.BOOL
-_KERNEL32.GetFileInformationByHandleEx.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-]
-_KERNEL32.GetFileInformationByHandleEx.restype = wintypes.BOOL
-_KERNEL32.SetFileInformationByHandle.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-]
-_KERNEL32.SetFileInformationByHandle.restype = wintypes.BOOL
-_KERNEL32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
-_KERNEL32.SetFileAttributesW.restype = wintypes.BOOL
+def _configure_windows_api(kernel32: Any) -> None:
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.ReadFile.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    kernel32.SetFilePointerEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    kernel32.SetFileAttributesW.restype = wintypes.BOOL
+
+
+if os.name == "nt":
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _configure_windows_api(_KERNEL32)
+else:
+    _KERNEL32 = None
 
 
 @dataclass(frozen=True)
@@ -155,11 +166,42 @@ def _remove_readonly(path: Path) -> None:
         return
     if not path.is_file():
         return
+    if os.name != "nt":
+        path.unlink(missing_ok=True)
+        return
     _KERNEL32.SetFileAttributesW(str(path), _FILE_ATTRIBUTE_NORMAL)
     path.unlink(missing_ok=True)
 
 
+def _publish_posix_exclusive_readonly(path: Path, data: bytes) -> bool:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd: int | None = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
+    succeeded = False
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = None
+            if handle.write(data) != len(data):
+                raise OSError("short write while publishing immutable file")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o444)
+        if read_evidence(path, calculate_hash=False).data != data:
+            raise RuntimeError(f"published file read-back mismatch: {path.name}")
+        succeeded = True
+        return True
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if not succeeded:
+            path.unlink(missing_ok=True)
+
+
 def _publish_exclusive_readonly(path: Path, data: bytes) -> bool:
+    if os.name != "nt":
+        return _publish_posix_exclusive_readonly(path, data)
     handle = _KERNEL32.CreateFileW(
         str(path),
         _GENERIC_READ | _GENERIC_WRITE | _FILE_WRITE_ATTRIBUTES,
@@ -200,6 +242,8 @@ def _publish_exclusive_readonly(path: Path, data: bytes) -> bool:
 
 
 def _read_existing_exclusive_readonly(path: Path) -> bytes:
+    if os.name != "nt":
+        return read_evidence(path, calculate_hash=False).data
     handle = _KERNEL32.CreateFileW(
         str(path),
         _GENERIC_READ | _FILE_WRITE_ATTRIBUTES,
@@ -231,23 +275,40 @@ def _target_lock(target: Path, timeout: float = 30.0):
     try:
         lock_path = target.with_suffix(target.suffix + ".lock")
         with lock_path.open("a+b") as handle:
-            if handle.seek(0, os.SEEK_END) == 0:
-                handle.write(b"\0")
-                handle.flush()
-            while True:
-                try:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time_module.monotonic() >= deadline:
-                        raise TimeoutError(f"timed out waiting for snapshot lock: {target.name}")
-                    time_module.sleep(0.02)
+            if os.name == "nt":
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if time_module.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for snapshot lock: {target.name}"
+                            ) from exc
+                        time_module.sleep(0.02)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if time_module.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for snapshot lock: {target.name}"
+                            ) from exc
+                        time_module.sleep(0.02)
             try:
                 yield
             finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         thread_lock.release()
 

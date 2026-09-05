@@ -33,7 +33,7 @@ def _validated_previous(previous: dict[str, Any] | None, supplier: str) -> dict[
         if not isinstance(product_id, str) or not isinstance(record, dict):
             raise TypeError("invalid missing-product state record")
         count = record.get("consecutive_missing_runs", 0)
-        if not isinstance(count, int) or count < 0:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError("invalid consecutive_missing_runs")
     return state
 
@@ -52,8 +52,10 @@ def update_missing_state(
         raise ValueError("supplier and run_id are required for missing-product state")
     if any(not product_id or not sku for product_id, sku in missing_products.items()):
         raise ValueError("missing-product state requires product IDs and SKUs")
-    if threshold is not None and threshold < 1:
-        raise ValueError("missing-product threshold must be positive")
+    if threshold is not None and (
+        not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1
+    ):
+        raise ValueError("missing-product threshold must be a positive integer")
     state = _validated_previous(previous, supplier)
     products = state["products"]
 

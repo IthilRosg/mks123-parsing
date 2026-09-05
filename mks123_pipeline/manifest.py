@@ -217,7 +217,7 @@ def code_identity(project_root: Path, adapter_module: Path | None = None) -> dic
         data = read_evidence(path).data
         files[path.relative_to(project_root).as_posix()] = {"sha256": _sha256(data), "size": len(data)}
     dependencies = {}
-    for distribution in ("defusedxml", "duckdb", "fsspec", "pydantic", "PyYAML"):
+    for distribution in ("defusedxml", "duckdb", "fsspec", "pandas", "pydantic", "PyYAML"):
         try:
             dependencies[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
