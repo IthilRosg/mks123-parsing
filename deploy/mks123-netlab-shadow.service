@@ -1,0 +1,24 @@
+[Unit]
+Description=mks123 Netlab read-only content shadow cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zenit
+Group=zenit
+WorkingDirectory=/opt/mks123/supplier-pipeline
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mks123/supplier-pipeline/.venv/bin/python /opt/mks123/supplier-pipeline/scripts/run_netlab_shadow.py --catalog /var/lib/mks123-netlab-shadow/catalog-products.csv --config /opt/mks123/supplier-pipeline/config/netlab.yaml --raw-root /var/lib/mks123-netlab-shadow/raw --runs-root /var/lib/mks123-netlab-shadow/runs
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/mks123-netlab-shadow
+
+[Install]
+WantedBy=multi-user.target

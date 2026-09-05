@@ -12,6 +12,7 @@ from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 
 from .electrozone import FeedValidationError
+from .integrity import read_evidence
 from .models import Category, SupplierItem, SupplierSnapshot
 
 
@@ -183,8 +184,7 @@ def _images(offer: ET.Element, fields: tuple[str, ...]) -> list[str]:
 
 
 def _read_source(path: Path, max_bytes: int) -> bytes:
-    with path.open("rb") as handle:
-        source_data = handle.read(max_bytes + 1)
+    source_data = read_evidence(path, max_bytes=max_bytes).data
     if len(source_data) > max_bytes:
         raise FeedValidationError(f"source size exceeds byte limit: {max_bytes}")
     return source_data

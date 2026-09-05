@@ -121,3 +121,94 @@ def test_non_rub_price_is_blocked_without_fx_policy() -> None:
     assert proposal.status == "blocked_currency"
     assert proposal.proposed_price is None
     assert proposal.warnings == ["currency_not_approved"]
+
+
+def test_non_netlab_supplier_cannot_use_supplier_feed_fx_primitive() -> None:
+    context = PricingContext(
+        rates={
+            "USD": ExchangeRate(
+                currency="USD",
+                rub_per_unit=Decimal("86.89"),
+                source="supplier_feed",
+                observed_at="2026-09-04 09:04",
+                approved=True,
+                supplier_id="electrozone",
+                source_sha256="b" * 64,
+            )
+        },
+        rule=MarkupRule(
+            id="supplier-price-plus-10",
+            version="2026-09-03",
+            approved=True,
+            multiplier=Decimal("1.10"),
+        ),
+        vat_basis="included",
+    )
+    electrozone_item = item("270").model_copy(update={"currency": "USD"})
+
+    proposal = build_proposal(
+        electrozone_item,
+        exact_match(),
+        current_price=Decimal(25000),
+        context=context,
+    )
+
+    assert proposal.status == "blocked_currency"
+    assert proposal.proposed_price is None
+    assert proposal.warnings == ["currency_not_approved"]
+
+
+def test_netlab_usd_uses_approved_rate_bound_to_supplier_snapshot() -> None:
+    source_sha256 = "b" * 64
+    context = PricingContext(
+        rates={
+            "USD": ExchangeRate(
+                currency="USD",
+                rub_per_unit=Decimal("86.89"),
+                source="supplier_feed",
+                observed_at="2026-09-04 09:04",
+                approved=True,
+                supplier_id="netlab",
+                source_sha256=source_sha256,
+            )
+        },
+        rule=MarkupRule(
+            id="supplier-price-plus-10",
+            version="2026-09-03",
+            approved=True,
+            multiplier=Decimal("1.10"),
+        ),
+        vat_basis="included",
+    )
+    netlab_item = item("270").model_copy(update={"supplier": "netlab", "currency": "USD"})
+
+    proposal = build_proposal(
+        netlab_item,
+        exact_match(),
+        current_price=Decimal(25000),
+        context=context,
+    )
+
+    assert proposal.cost_rub == Decimal("23460.30")
+    assert proposal.calculated_price == Decimal("25806.3300")
+    assert proposal.proposed_price == Decimal("25806.3300")
+    assert proposal.exchange_rate == Decimal("86.89")
+    assert proposal.exchange_rate_source == "supplier_feed"
+    assert proposal.status == "ready_for_review"
+
+
+    with pytest.raises(ValueError, match="rate map key"):
+        PricingContext(
+            rates={
+                "USD": ExchangeRate(
+                    currency="EUR",
+                    rub_per_unit=Decimal("86.89"),
+                    source="supplier_feed",
+                    observed_at="2026-09-04 13:04",
+                    approved=True,
+                    supplier_id="netlab",
+                    source_sha256="a" * 64,
+                )
+            },
+            rule=None,
+        )

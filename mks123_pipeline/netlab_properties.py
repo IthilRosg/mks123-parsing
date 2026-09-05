@@ -12,6 +12,7 @@ from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 
 from .electrozone import FeedValidationError
+from .integrity import read_evidence
 
 _PROPERTY_ID_RE = re.compile(r"p[1-9][0-9]*\Z")
 _ITEM_ID_RE = re.compile(r"[1-9][0-9]*\Z")
@@ -52,9 +53,8 @@ def _node_text(node: ET.Element) -> str:
 
 def _read_source(path: Path, max_bytes: int) -> bytes:
     try:
-        with path.open("rb") as handle:
-            data = handle.read(max_bytes + 1)
-    except OSError as exc:
+        data = read_evidence(path, max_bytes=max_bytes).data
+    except (OSError, ValueError) as exc:
         raise FeedValidationError(f"cannot read Netlab properties source: {exc}") from exc
     if len(data) > max_bytes:
         raise FeedValidationError(f"Netlab properties source exceeds byte limit: {max_bytes}")
@@ -90,6 +90,7 @@ def scan_netlab_properties(
     *,
     max_bytes: int = 128 * 1024 * 1024,
     emit: Callable[[NetlabPropertyObservation], None] | None = None,
+    emit_item: Callable[[str, tuple[NetlabPropertyObservation, ...]], None] | None = None,
     allow_unknown_property_ids: bool = False,
 ) -> NetlabPropertiesStats:
     """Validate and stream the official Netlab GoodsProperties XML."""
@@ -111,6 +112,7 @@ def scan_netlab_properties(
     unknown_observation_count = 0
     catalog_date: str | None = None
     root_seen = False
+    element_stack: list[str] = []
 
     try:
         context = ET.iterparse(BytesIO(source_data), events=("start", "end"))
@@ -126,7 +128,20 @@ def scan_netlab_properties(
                     catalog_date = (element.attrib.get("date") or "").strip()
                     if not _DATE_RE.fullmatch(catalog_date):
                         raise FeedValidationError(f"invalid Netlab properties catalog date: {catalog_date!r}")
+                element_stack.append(tag)
                 continue
+
+            parent = element_stack[-2] if len(element_stack) >= 2 else None
+            if tag == "properties" and parent != "xml_catalog":
+                raise FeedValidationError("Netlab properties container must be a direct child of xml_catalog")
+            if tag == "items" and parent != "xml_catalog":
+                raise FeedValidationError("Netlab items container must be a direct child of xml_catalog")
+            if tag == "property" and parent != "properties":
+                raise FeedValidationError("Netlab property must be a direct child of properties")
+            if tag == "item" and parent != "items":
+                raise FeedValidationError("Netlab item must be a direct child of items")
+            if not element_stack or element_stack[-1] != tag:
+                raise FeedValidationError("Netlab properties XML element ancestry is invalid")
 
             if tag == "property":
                 property_id = (element.attrib.get("id") or "").strip()
@@ -151,6 +166,7 @@ def scan_netlab_properties(
                     raise FeedValidationError(f"duplicate Netlab properties item id: {item_id}")
                 item_ids.add(item_id)
                 seen_property_ids: set[str] = set()
+                item_observations: list[NetlabPropertyObservation] = []
                 for child in list(element):
                     property_id = child.tag
                     if not isinstance(property_id, str) or not _PROPERTY_ID_RE.fullmatch(property_id):
@@ -178,14 +194,18 @@ def scan_netlab_properties(
                     )
                     if emit is not None:
                         emit(observation)
+                    item_observations.append(observation)
                     observation_count += 1
                     if missing:
                         missing_observation_count += 1
+                if emit_item is not None:
+                    emit_item(item_id, tuple(item_observations))
                 item_count += 1
                 element.clear()
             elif tag == "items":
                 items_container_count += 1
                 element.clear()
+            element_stack.pop()
     except FeedValidationError:
         raise
     except (ET.ParseError, UnicodeError, DefusedXmlException) as exc:

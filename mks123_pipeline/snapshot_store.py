@@ -15,9 +15,12 @@ from datetime import date, time
 from pathlib import Path
 from typing import Any
 
+from .integrity import read_evidence
+
 _FEED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SUPPLIER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_SOURCE_SUFFIX = re.compile(r"^\.(?:feed|xml|yml|zip)$")
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 _GENERIC_READ = 0x80000000
@@ -255,10 +258,13 @@ def snapshot_target(
     content_hash: str,
     *,
     supplier_id: str = "electrozone",
+    source_suffix: str = ".yml",
 ) -> Path:
     root = Path(root).resolve()
     if not _SUPPLIER_ID.fullmatch(supplier_id):
         raise ValueError("invalid supplier id for snapshot target")
+    if not _SOURCE_SUFFIX.fullmatch(source_suffix):
+        raise ValueError("invalid snapshot source suffix")
     if not _FEED_DATE.fullmatch(feed_date):
         raise ValueError("invalid feed catalog date; expected YYYY-MM-DD HH:MM")
     try:
@@ -269,7 +275,7 @@ def snapshot_target(
     if not _SHA256.fullmatch(content_hash):
         raise ValueError("invalid SHA-256 content hash")
     stamp = f"{feed_day:%Y%m%d}T{feed_time:%H%M}"
-    target = (root / f"{supplier_id}-live-{stamp}-{content_hash[:12]}.yml").resolve()
+    target = (root / f"{supplier_id}-live-{stamp}-{content_hash[:12]}{source_suffix}").resolve()
     if target.parent != root:
         raise ValueError("snapshot target escapes configured root")
     return target
@@ -307,19 +313,26 @@ def install_snapshot(
     content_hash: str,
     metadata: dict[str, Any],
     required_existing_metadata: dict[str, Any] | None = None,
+    source_suffix: str = ".yml",
 ) -> SnapshotInstallResult:
     part = Path(part)
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if part.resolve().parent != root:
         raise ValueError("snapshot temporary file must be inside configured root")
-    source_data = part.read_bytes()
+    source_data = read_evidence(part, calculate_hash=False).data
     if hashlib.sha256(source_data).hexdigest() != content_hash:
         raise ValueError("snapshot temporary file hash mismatch")
     supplier_id = metadata.get("supplier")
     if not isinstance(supplier_id, str) or not _SUPPLIER_ID.fullmatch(supplier_id):
         raise ValueError("snapshot metadata requires a valid supplier id")
-    target = snapshot_target(root, feed_date, content_hash, supplier_id=supplier_id)
+    target = snapshot_target(
+        root,
+        feed_date,
+        content_hash,
+        supplier_id=supplier_id,
+        source_suffix=source_suffix,
+    )
     with _target_lock(target):
         created = _publish_exclusive_readonly(target, source_data)
         metadata_created = False

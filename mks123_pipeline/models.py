@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -37,6 +38,9 @@ class SupplierItem(BaseModel):
     source_url: str | None = None
     image_urls: list[str] = Field(default_factory=list)
     description: str | None = None
+    description_html: str | None = None
+    properties: list[dict[str, Any]] = Field(default_factory=list)
+    content_provenance: dict[str, Any] = Field(default_factory=dict)
     sales_notes: str | None = None
     manufacturer_warranty: bool | None = None
     warranty_days: str | None = None

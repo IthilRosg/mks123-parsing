@@ -23,12 +23,10 @@ pricing:
   vat_basis: included
   vat_policy_approved: true
   exchange_rates:
-    RUR:
-      rub_per_unit: 1
-      source: base_currency_parity
-    RUB:
-      rub_per_unit: 1
-      source: base_currency_parity
+    USD:
+      source: supplier_feed
+      min_rub_per_unit: 40
+      max_rub_per_unit: 200
   markup_policy:
     approved: true
     rules:

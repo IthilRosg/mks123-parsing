@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -88,6 +89,42 @@ VETCOM_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
   </shop>
 </yml_catalog>
 """
+
+
+def _write_netlab_metadata(
+    source: Path,
+    *,
+    fetched_at: str,
+    feed_catalog_date: str = "2026-03-12 16:39",
+    item_count: int = 1,
+    usd_rate: str = "1",
+) -> Path:
+    data = source.read_bytes()
+    metadata = {
+        "supplier": "netlab",
+        "feed_kind": "price",
+        "source": "direct_https",
+        "source_url": "https://www.netlab.ru/products/pricexml4.zip",
+        "fetched_at_utc": fetched_at,
+        "local_file": source.name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+        "content_type": "application/zip",
+        "http_status": 200,
+        "etag": None,
+        "last_modified": None,
+        "feed_catalog_date": feed_catalog_date,
+        "item_count": item_count,
+        "currency_rates": {"USD": usd_rate},
+        "credentials_persisted": False,
+        "publication_enabled": False,
+        "production_writes": 0,
+        "max_feed_age_hours": 24,
+        "feed_age_seconds": 10860.0,
+    }
+    path = source.with_suffix(".metadata.json")
+    path.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 def _write_feed(tmp_path: Path, name: str, content: str) -> Path:
@@ -269,7 +306,13 @@ def test_vetcom_negative_quantity_is_preserved_and_not_available(tmp_path: Path)
 
 
 def test_runner_does_not_compare_usd_source_to_rub_catalog(tmp_path: Path) -> None:
-    source = _write_feed(tmp_path, "netlab-run.xml", NETLAB_FIXTURE)
+    source = tmp_path / "netlab-run.zip"
+    with ZipFile(source, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("Price.xml", NETLAB_FIXTURE)
+    source_metadata = _write_netlab_metadata(
+        source,
+        fetched_at="2026-03-12T16:40:00Z",
+    )
     catalog = tmp_path / "catalog.csv"
     catalog.write_text(
         "product_id,model,sku,ean,name,manufacturer,price,quantity,status,category_ids,categories\n"
@@ -286,6 +329,7 @@ def test_runner_does_not_compare_usd_source_to_rub_catalog(tmp_path: Path) -> No
         max_source_items=10,
         max_source_bytes=64 * 1024,
         adapter=NetlabAdapter(),
+        source_metadata_path=source_metadata,
     )
 
     assert summary["matches"] == {"exact": 1}

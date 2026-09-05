@@ -2,6 +2,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import yaml
 
 from mks123_pipeline.config import load_pilot_config, pricing_context_from_config
 
@@ -228,10 +229,146 @@ publication: {enabled: false}
 def test_all_supplier_configs_enable_the_same_read_only_simple_pricing_policy(config_name: str) -> None:
     project = Path(__file__).parents[1]
     config = load_pilot_config(project / "config" / config_name)
-    pricing = pricing_context_from_config(config.pricing, observed_at="2026-09-03T10:00:00Z")
+    if config.supplier.id == "netlab":
+        pricing = pricing_context_from_config(
+            config.pricing,
+            observed_at="2026-09-04 09:04",
+            supplier_id="netlab",
+            supplier_rates={"USD": Decimal("86.89")},
+            source_sha256="d" * 64,
+        )
+    else:
+        pricing = pricing_context_from_config(
+            config.pricing,
+            observed_at="2026-09-03T10:00:00Z",
+        )
 
     assert config.publication.enabled is False
     assert pricing.vat_basis == "included"
     assert pricing.rule is not None
     assert pricing.rule.multiplier == Decimal("1.10")
     assert "rounding_increment" not in pricing.rule.model_dump()
+
+
+def test_netlab_config_resolves_usd_rate_from_same_supplier_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "netlab.yaml"
+    path.write_text(
+        """supplier:
+  id: netlab
+  scope: {catalog_sku_prefix: "31"}
+  source: {type: supplier_xml_zip, url: "https://www.netlab.ru/products/pricexml4.zip", min_offer_count: 60000, max_offer_count: 100000, max_response_bytes: 134217728}
+pricing:
+  base_currency: RUB
+  vat_basis: included
+  vat_policy_approved: true
+  exchange_rates:
+    USD:
+      source: supplier_feed
+      min_rub_per_unit: 40
+      max_rub_per_unit: 200
+  markup_policy:
+    approved: true
+    rules:
+      - {id: supplier-price-plus-10, version: "2026-09-03", multiplier: 1.10}
+  rounding: {mode: exact, increment_rub: null}
+publication: {enabled: false}
+""",
+        encoding="utf-8",
+    )
+    config = load_pilot_config(path)
+    source_sha256 = "c" * 64
+
+    pricing = pricing_context_from_config(
+        config.pricing,
+        observed_at="2026-09-04 09:04",
+        supplier_id=config.supplier.id,
+        supplier_rates={"USD": Decimal("86.89")},
+        source_sha256=source_sha256,
+    )
+
+    assert pricing.rates["USD"].rub_per_unit == Decimal("86.89")
+    assert pricing.rates["USD"].source == "supplier_feed"
+    assert pricing.rates["USD"].approved is True
+    assert pricing.rates["USD"].supplier_id == "netlab"
+    assert pricing.rates["USD"].source_sha256 == source_sha256
+
+
+def test_repository_netlab_profile_uses_only_bounded_supplier_feed_usd_rate() -> None:
+    project = Path(__file__).parents[1]
+    config = load_pilot_config(project / "config/netlab.yaml")
+
+    assert set(config.pricing.exchange_rates) == {"USD"}
+    rate = config.pricing.exchange_rates["USD"]
+    assert rate.source == "supplier_feed"
+    assert rate.rub_per_unit is None
+    assert rate.min_rub_per_unit == Decimal(40)
+    assert rate.max_rub_per_unit == Decimal(200)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("min_offer_count", 59_999),
+        ("max_offer_count", 100_001),
+        ("max_response_bytes", 134_217_729),
+    ],
+)
+def test_netlab_config_cannot_weaken_hard_acquisition_limits(
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    project = Path(__file__).parents[1]
+    payload = yaml.safe_load((project / "config/netlab.yaml").read_text(encoding="utf-8"))
+    payload["supplier"]["source"][field] = value
+    config_path = tmp_path / "netlab-unsafe.yaml"
+    config_path.write_text(yaml.safe_dump(payload, allow_unicode=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Netlab acquisition safety contract"):
+        load_pilot_config(config_path)
+
+
+def test_supplier_feed_fx_is_rejected_outside_netlab_usd(tmp_path: Path) -> None:
+    config_path = tmp_path / "supplier-controlled-fx.yaml"
+    config_path.write_text(
+        """supplier:
+  id: supplier-b
+  scope: {catalog_sku_prefix: "51"}
+  source: {min_offer_count: 1, max_offer_count: 10, max_response_bytes: 1024}
+pricing:
+  vat_basis: unknown
+  vat_policy_approved: false
+  exchange_rates:
+    EUR: {source: supplier_feed, min_rub_per_unit: 1, max_rub_per_unit: 1000}
+  markup_policy: {approved: false, rules: []}
+publication: {enabled: false}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="supplier-feed FX is approved only for Netlab USD"):
+        load_pilot_config(config_path)
+
+
+def test_unapproved_diagnostic_policy_preserves_configured_fixed_rate(tmp_path: Path) -> None:
+    config_path = tmp_path / "diagnostic.yaml"
+    config_path.write_text(
+        """supplier:
+  id: electrozone
+  scope: {catalog_sku_prefix: "11"}
+  source: {min_offer_count: 1, max_offer_count: 10, max_response_bytes: 1024}
+pricing:
+  vat_basis: unknown
+  vat_policy_approved: false
+  exchange_rates:
+    RUR: {rub_per_unit: 2.5, source: base_currency_parity}
+  markup_policy: {approved: false, rules: []}
+publication: {enabled: false}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_pilot_config(config_path)
+    pricing = pricing_context_from_config(config.pricing, observed_at="2026-09-04T10:00:00Z")
+
+    assert pricing.rates["RUR"].rub_per_unit == Decimal("2.5")

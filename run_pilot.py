@@ -15,6 +15,11 @@ parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--fetched-at", required=True)
 parser.add_argument("--config", type=Path, default=Path(__file__).parent / "config/pilot.yaml")
 parser.add_argument("--previous-state", type=Path, default=None)
+parser.add_argument("--source-metadata", type=Path, default=None)
+parser.add_argument("--properties", type=Path, default=None)
+parser.add_argument("--properties-metadata", type=Path, default=None)
+parser.add_argument("--properties-fetched-at", default=None)
+parser.add_argument("--max-source-bytes", type=int, default=None)
 args = parser.parse_args()
 config = load_pilot_config(args.config)
 adapter = create_adapter(
@@ -28,10 +33,20 @@ summary = run_pilot(
     args.fetched_at,
     min_source_items=config.supplier.source.min_offer_count,
     max_source_items=config.supplier.source.max_offer_count,
-    max_source_bytes=config.supplier.source.max_response_bytes,
+    max_source_bytes=args.max_source_bytes or config.supplier.source.max_response_bytes,
     adapter=adapter,
-    pricing=pricing_context_from_config(config.pricing, observed_at=args.fetched_at),
+    pricing_resolver=lambda snapshot: pricing_context_from_config(
+        config.pricing,
+        observed_at=snapshot.catalog_date or args.fetched_at,
+        supplier_id=config.supplier.id,
+        supplier_rates=snapshot.currencies,
+        source_sha256=snapshot.source_sha256,
+    ),
     config_path=args.config,
+    source_metadata_path=args.source_metadata,
+    properties_path=args.properties,
+    properties_metadata_path=args.properties_metadata,
+    properties_fetched_at=args.properties_fetched_at,
     previous_state_path=args.previous_state,
     missing_product_action=(config.stock.missing_product_policy.action if config.stock else None),
     consecutive_missing_runs=(config.stock.missing_product_policy.consecutive_missing_runs if config.stock else None),

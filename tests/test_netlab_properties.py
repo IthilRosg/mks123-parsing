@@ -97,6 +97,7 @@ def test_scan_netlab_properties_rejects_duplicate_property_tag(tmp_path: Path) -
         scan_netlab_properties(source, max_bytes=64 * 1024)
 
 
+
 def test_scan_netlab_properties_accepts_official_archive_and_seals_archive(tmp_path: Path) -> None:
     source = tmp_path / "GoodsProperties.zip"
     with ZipFile(source, "w", compression=ZIP_DEFLATED) as archive:
@@ -106,3 +107,21 @@ def test_scan_netlab_properties_accepts_official_archive_and_seals_archive(tmp_p
 
     assert stats.source_sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
     assert stats.item_count == 2
+
+
+@pytest.mark.parametrize("container", ["properties", "items"])
+def test_scan_netlab_properties_rejects_containers_without_required_root_ancestry(
+    tmp_path: Path,
+    container: str,
+) -> None:
+    malformed = PROPERTIES_FIXTURE.replace(
+        f"  <{container}>",
+        f"  <wrapper>\n    <{container}>",
+    ).replace(
+        f"  </{container}>",
+        f"    </{container}>\n  </wrapper>",
+    )
+    source = _write_source(tmp_path, malformed)
+
+    with pytest.raises(FeedValidationError, match="must be a direct child"):
+        scan_netlab_properties(source, max_bytes=64 * 1024)

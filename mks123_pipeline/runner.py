@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import json
 import msvcrt
@@ -13,6 +12,7 @@ import tempfile
 import threading
 import time as time_module
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -22,10 +22,16 @@ import duckdb
 
 from .adapters import ElectrozoneAdapter, SupplierAdapter
 from .category_mapping import build_category_mapping
-from .db_digest import database_content_sha256
-from .integrity import build_run_seal
+from .db_digest import DUCKDB_SAFE_CONFIG, database_content_sha256
+from .integrity import build_run_seal, read_evidence
 from .manifest import build_run_manifest, capture_run_inputs, write_run_manifest
 from .matcher import CatalogItem, match_supplier_items
+from .netlab_acquisition import (
+    parse_netlab_acquisition_metadata,
+    validate_netlab_acquisition_metadata,
+    validate_netlab_properties_acquisition_metadata,
+)
+from .netlab_content import NetlabEnrichmentResult, enrich_netlab_snapshot
 from .pricing import ExchangeRate, PricingContext, build_proposal
 from .state import update_missing_state
 
@@ -48,11 +54,7 @@ _RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return read_evidence(path).sha256
 
 
 def _csv_value(value: Any) -> Any:
@@ -77,6 +79,38 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) ->
         writer.writeheader()
         for row in rows:
             writer.writerow({key: _csv_value(row.get(key)) for key in fieldnames})
+
+
+def _quote_duckdb_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError("DuckDB identifier is invalid")
+    return f'"{value}"'
+
+
+def _write_duckdb(
+    database: Path,
+    specifications: list[tuple[str, list[str], list[dict[str, Any]]]],
+) -> None:
+    memory_only_config = {**DUCKDB_SAFE_CONFIG, "enable_external_access": "true"}
+    with duckdb.connect(str(database), config=memory_only_config) as db:
+        db.execute("SET allowed_directories = []")
+        for table_name, fieldnames, rows in specifications:
+            _quote_duckdb_identifier(table_name)
+            buffer = io.StringIO(newline="")
+            writer = csv.DictWriter(
+                buffer,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(
+                {name: _csv_value(row.get(name)) for name in fieldnames} for row in rows
+            )
+            buffer.seek(0)
+            relation = db.read_csv(buffer, header=True, all_varchar=True)
+            relation.to_table(table_name)
+        db.execute("SET enable_external_access = 'false'")
 
 
 @contextmanager
@@ -143,8 +177,9 @@ def _remove_abandoned_staging(output_dir: Path) -> None:
 
 
 def _load_catalog(path: Path, *, sku_prefix: str = "11") -> tuple[list[CatalogItem], str]:
-    source_bytes = path.read_bytes()
-    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    evidence = read_evidence(path)
+    source_bytes = evidence.data
+    source_hash = evidence.sha256
     result: list[CatalogItem] = []
     with io.StringIO(source_bytes.decode("utf-8-sig"), newline="") as handle:
         reader = csv.DictReader(handle)
@@ -261,7 +296,12 @@ def _build_pilot(
     max_source_bytes: int = 64 * 1024 * 1024,
     adapter: SupplierAdapter | None = None,
     pricing: PricingContext | None = None,
+    pricing_resolver: Callable[[Any], PricingContext] | None = None,
     config_path: str | Path | None = None,
+    source_metadata_path: str | Path | None = None,
+    properties_path: str | Path | None = None,
+    properties_metadata_path: str | Path | None = None,
+    properties_fetched_at: str | None = None,
     previous_state_path: str | Path | None = None,
     missing_product_action: str | None = None,
     consecutive_missing_runs: int | None = None,
@@ -272,17 +312,35 @@ def _build_pilot(
     original_source_path = source_path
     original_catalog_path = catalog_csv
     original_config_path = Path(config_path) if config_path is not None else None
+    original_source_metadata_path = Path(source_metadata_path) if source_metadata_path is not None else None
+    original_properties_path = Path(properties_path) if properties_path is not None else None
+    original_properties_metadata_path = (
+        Path(properties_metadata_path) if properties_metadata_path is not None else None
+    )
     original_state_path = Path(previous_state_path) if previous_state_path is not None else None
-    input_records, source_path, catalog_csv, _, bundled_state = capture_run_inputs(
+    input_records, source_path, catalog_csv, _, bundled_state, bundled_source_metadata, bundled_properties, bundled_properties_metadata = capture_run_inputs(
         output_dir,
         source_path,
         catalog_csv,
         original_config_path,
         original_state_path,
+        source_metadata_path=original_source_metadata_path,
+        properties_path=original_properties_path,
+        properties_metadata_path=original_properties_metadata_path,
         source_max_bytes=max_source_bytes,
     )
 
     adapter = adapter or ElectrozoneAdapter()
+    if adapter.supplier_id != "netlab" and (
+        bundled_properties is not None or bundled_properties_metadata is not None
+    ):
+        raise ValueError("properties enrichment is supported only for the Netlab adapter")
+    if adapter.supplier_id == "netlab" and (
+        source_path.suffix.casefold() != ".zip" or bundled_source_metadata is None
+    ):
+        raise ValueError(
+            "Netlab pricing requires an accepted immutable supplier ZIP with acquisition metadata"
+        )
     snapshot = adapter.parse(
         source_path,
         fetched_at=fetched_at,
@@ -297,6 +355,34 @@ def _build_pilot(
         min_items=min_source_items,
         max_items=max_source_items,
     )
+    if adapter.supplier_id == "netlab":
+        metadata_payload = parse_netlab_acquisition_metadata(read_evidence(bundled_source_metadata).data)
+        validate_netlab_acquisition_metadata(
+            metadata_payload,
+            source_data=read_evidence(source_path).data,
+            expected_fetched_at=fetched_at,
+            expected_catalog_date=snapshot.catalog_date,
+            expected_item_count=len(snapshot.items),
+            expected_currency_rates=snapshot.currencies,
+        )
+    content_result: NetlabEnrichmentResult | None = None
+    if bundled_properties is not None and bundled_properties_metadata is not None:
+        if adapter.supplier_id != "netlab":
+            raise ValueError("properties enrichment is supported only for the Netlab adapter")
+        content_result = enrich_netlab_snapshot(snapshot, bundled_properties, max_bytes=max_source_bytes)
+        properties_metadata = parse_netlab_acquisition_metadata(read_evidence(bundled_properties_metadata).data)
+        validate_netlab_properties_acquisition_metadata(
+            properties_metadata,
+            source_data=read_evidence(bundled_properties).data,
+            expected_fetched_at=properties_fetched_at or fetched_at,
+            expected_catalog_date=content_result.properties_stats.catalog_date,
+            expected_stats=content_result.properties_stats,
+        )
+        snapshot = snapshot.model_copy(update={"items": content_result.items})
+    if pricing is not None and pricing_resolver is not None:
+        raise ValueError("pricing and pricing_resolver are mutually exclusive")
+    if pricing_resolver is not None:
+        pricing = pricing_resolver(snapshot)
     catalog, catalog_sha256 = _load_catalog(catalog_csv, sku_prefix=adapter.catalog_sku_prefix)
     catalog_by_id = {item.product_id: item for item in catalog}
     supplier_by_id = {item.supplier_item_id: item for item in snapshot.items}
@@ -309,7 +395,7 @@ def _build_pilot(
     previous_state: dict[str, Any] | None = None
     if bundled_state is not None:
         try:
-            previous_state = json.loads(bundled_state.read_text(encoding="utf-8"))
+            previous_state = json.loads(read_evidence(bundled_state).data.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("invalid previous missing-product state") from exc
     state_run_id = f"{adapter.supplier_id}-{snapshot.source_sha256[:12]}-catalog-{catalog_sha256[:12]}"
@@ -396,9 +482,13 @@ def _build_pilot(
         "current_price", "source_available", "catalog_quantity",
     ]
     _write_csv(output_dir / "matches/review_queue.csv", review_queue_rows, review_queue_fields)
+    catalog_missing_rows = [
+        {"product_id": product_id, "sku": catalog_by_id[product_id].sku}
+        for product_id in match_result.catalog_missing_supplier
+    ]
     _write_csv(
         output_dir / "matches/catalog_missing_supplier.csv",
-        [{"product_id": product_id, "sku": catalog_by_id[product_id].sku} for product_id in match_result.catalog_missing_supplier],
+        catalog_missing_rows,
         ["product_id", "sku"],
     )
     _write_csv(output_dir / "proposals/proposals.csv", proposal_rows, proposal_fields)
@@ -452,6 +542,33 @@ def _build_pilot(
         if catalog
         else Decimal(1)
     )
+    content_summary: dict[str, Any]
+    if content_result is None:
+        content_summary = {"enabled": False, "reason": "properties_input_not_provided"}
+    else:
+        stats = content_result.properties_stats
+        content_summary = {
+            "enabled": True,
+            "join_key": "price_offer.uid=GoodsProperties.item.@id",
+            "description_property_id": "p9999995",
+            "properties_source_sha256": stats.source_sha256,
+            "properties_catalog_date": stats.catalog_date,
+            "properties_item_count": stats.item_count,
+            "properties_count": stats.property_count,
+            "properties_observation_count": stats.observation_count,
+            "properties_missing_observation_count": stats.missing_observation_count,
+            "unknown_property_id_count": stats.unknown_property_id_count,
+            "unknown_observation_count": stats.unknown_observation_count,
+            "uid_price_items": content_result.uid_price_items,
+            "uid_properties_overlap": content_result.uid_properties_overlap,
+            "description_items": content_result.description_items,
+            "invalid_image_url_count": content_result.invalid_image_url_count,
+            "missing_uid_count": content_result.missing_uid_count,
+            "duplicate_uid_count": content_result.duplicate_uid_count,
+            "properties_fetched_at": properties_fetched_at or fetched_at,
+            "detail_pages": "not_fetched",
+            "review_only_unknown_properties": True,
+        }
     summary = {
         "supplier": adapter.supplier_id,
         "catalog_sku_prefix": adapter.catalog_sku_prefix,
@@ -485,6 +602,7 @@ def _build_pilot(
         "exact_source_price_vs_current": price_comparison,
         "exact_availability_vs_catalog": availability_comparison,
         "source_identity": source_identity,
+        "content_enrichment": content_summary,
         "category_mapping": category_mapping_summary,
         "vat_basis": pricing.vat_basis,
         "markup_policy": (
@@ -509,6 +627,7 @@ def _build_pilot(
         f"- Exact-match source/current price comparison: `{json.dumps(price_comparison, ensure_ascii=False, sort_keys=True)}`",
         f"- Exact-match availability comparison: `{json.dumps(availability_comparison, ensure_ascii=False, sort_keys=True)}`",
         f"- Source identity coverage: `{json.dumps(source_identity, ensure_ascii=False, sort_keys=True)}`",
+        f"- Content enrichment: `{json.dumps(content_summary, ensure_ascii=False, sort_keys=True)}`",
         f"- Category mapping proposals: `{json.dumps(category_mapping_summary, ensure_ascii=False, sort_keys=True)}`",
         f"- VAT basis: {summary['vat_basis']}.",
         f"- Markup policy: {summary['markup_policy']}.",
@@ -517,19 +636,19 @@ def _build_pilot(
     (output_dir / "reports/REPORT.md").write_text("\n".join(report) + "\n", encoding="utf-8")
 
     database = output_dir / "pilot.duckdb"
-    with duckdb.connect(str(database)) as db:
-        for table, rel_path in (
-            ("normalized_items", "normalized/items.csv"),
-            ("matches", "matches/matches.csv"),
-            ("source_only", "matches/source_only.csv"),
-            ("review_queue", "matches/review_queue.csv"),
-            ("proposals", "proposals/proposals.csv"),
-            ("category_mapping_proposals", "proposals/category-mapping-proposals.csv"),
-            ("product_category_proposals", "proposals/product-category-proposals.csv"),
-            ("catalog_missing_supplier", "matches/catalog_missing_supplier.csv"),
-        ):
-            csv_path = (output_dir / rel_path).as_posix().replace("'", "''")
-            db.execute(f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto('{csv_path}', header=true, all_varchar=true)")
+    _write_duckdb(
+        database,
+        [
+            ("normalized_items", normalized_fields, normalized_rows),
+            ("matches", match_fields, match_rows),
+            ("source_only", normalized_fields, source_only_rows),
+            ("review_queue", review_queue_fields, review_queue_rows),
+            ("proposals", proposal_fields, proposal_rows),
+            ("category_mapping_proposals", category_mapping_fields, category_mapping_rows),
+            ("product_category_proposals", product_category_fields, product_category_rows),
+            ("catalog_missing_supplier", ["product_id", "sku"], catalog_missing_rows),
+        ],
+    )
     summary["duckdb_content_sha256"] = database_content_sha256(database)
     (output_dir / "reports/summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -563,7 +682,12 @@ def run_pilot(
     max_source_bytes: int = 64 * 1024 * 1024,
     adapter: SupplierAdapter | None = None,
     pricing: PricingContext | None = None,
+    pricing_resolver: Callable[[Any], PricingContext] | None = None,
     config_path: str | Path | None = None,
+    source_metadata_path: str | Path | None = None,
+    properties_path: str | Path | None = None,
+    properties_metadata_path: str | Path | None = None,
+    properties_fetched_at: str | None = None,
     previous_state_path: str | Path | None = None,
     missing_product_action: str | None = None,
     consecutive_missing_runs: int | None = None,
@@ -592,7 +716,12 @@ def run_pilot(
                 max_source_bytes=max_source_bytes,
                 adapter=adapter,
                 pricing=pricing,
+                pricing_resolver=pricing_resolver,
                 config_path=config_path,
+                source_metadata_path=source_metadata_path,
+                properties_path=properties_path,
+                properties_metadata_path=properties_metadata_path,
+                properties_fetched_at=properties_fetched_at,
                 previous_state_path=previous_state_path,
                 missing_product_action=missing_product_action,
                 consecutive_missing_runs=consecutive_missing_runs,

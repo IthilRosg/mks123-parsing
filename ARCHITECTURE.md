@@ -117,7 +117,7 @@ OutOfProd       -> availability override
 url/picture*    -> source_url/image_urls
 ```
 
-`uid`, `priceR`…`priceF`, `priceRRP`, `currencyId`, `count`, `OutOfProd` and every other direct source field remain in the raw attribute map. `GoodsProperties.zip` is an independent streaming enrichment input; unknown legacy property IDs are retained as review-only observations rather than mapped by suffix. The supplier-owned run dated `2026-09-04 09:04` contained `66,070` offers and was accepted after strict XML/ZIP validation. Its all-USD price basis remains blocked by the current no-FX pricing policy.
+`uid`, `priceR`…`priceF`, `priceRRP`, `currencyId`, `count`, `OutOfProd` and every other direct source field remain in the raw attribute map. `GoodsProperties.zip` is an independent streaming enrichment input: the price offer `<uid>` joins only to `GoodsProperties.item.@id`, `p9999995` is the source description, and every property is retained with source-hash provenance. Unknown property IDs and invalid content remain review-only. The accepted Netlab pricing boundary uses `priceE` in USD and the USD→RUB rate from the same immutable `pricexml4.zip`.
 
 #### Vetcom adapter (`41`)
 
@@ -200,12 +200,12 @@ The 20 existing candidates remain a frozen review queue until a valid primary so
 Formula implemented by the approved price-preview policy:
 
 ```text
-site_price = source_price × 1.10
+site_price_rub = source_price × approved_rub_per_unit × 1.10
 VAT = already included in source_price
-proposed_price = site_price
+proposed_price = site_price_rub
 ```
 
-For RUR/RUB, the configured parity rate is `1`. A non-RUR/RUB source price requires its own explicit rate; the pipeline does not invent one. The preview deliberately adds no VAT adjustment, fixed cost, minimum-margin calculation or rounding.
+For RUR/RUB, the configured parity rate is `1`. For Netlab USD, the only approved rate is the positive `USD` value embedded in the same accepted supplier ZIP: it must be bounded to `40…200 RUB/USD`, bound to the source SHA-256 and supplier ID, and carried into the sealed policy manifest. The preview deliberately adds no VAT adjustment, fixed cost, minimum-margin calculation or rounding.
 
 Every proposal stores:
 
@@ -228,7 +228,7 @@ status
 warnings
 ```
 
-The supplier VAT codes (for example `VAT_22`) remain preserved provenance, not a calculation input. The approved policy explicitly records the source price as VAT-included and applies one global rule, `supplier-price-plus-10@2026-09-03`. Exact, warning-free RUR/RUB matches can therefore produce a review-only price proposal; no production writer is present.
+The supplier VAT codes (for example `VAT_22`) remain preserved provenance, not a calculation input. The approved policy explicitly records the source price as VAT-included and applies one global rule, `supplier-price-plus-10@2026-09-03`. Exact, warning-free matches with an approved, snapshot-bound rate can therefore produce a review-only price proposal; no production writer is present.
 
 #### Pricing policy precedence
 
@@ -237,8 +237,9 @@ The current first-phase policy has exactly one global rule. Product/category/man
 #### Currency policy
 
 - RUR/RUB feed values use the explicit parity rate `1`.
-- Other currencies are not enabled by the current simple policy and remain `blocked_currency`; no FX conversion is invented.
-- A future FX policy requires a separate approved version, timestamped source and tests.
+- Netlab USD requires `source=supplier_feed`; the rate, supplier ID, observation time and source SHA-256 are stored in the policy manifest.
+- Netlab direct acquisition treats `xml_catalog@date` as Moscow time, rejects snapshots older than 24 hours or more than 15 minutes in the future, and has no cached/external FX fallback.
+- Any other currency/source/supplier combination remains `blocked_currency`.
 - The 2021 OpenCart USD value is never used.
 
 #### VAT policy
@@ -293,9 +294,13 @@ run_summary
 
 The pilot creates normalized, matches, source-only, review-queue, missing-catalog and proposal tables represented by CSV artifacts; manifests and summary remain JSON until productionization.
 
+#### Netlab refresh supervisor
+
+The supervisor first issues conditional GETs for both `pricexml4.zip` and `GoodsProperties.zip` using `ETag`/`Last-Modified` from validated immutable metadata. A `304` creates an append-only acquisition receipt and can reuse local bytes only after size, SHA-256 and freshness checks; HTTP validators are bandwidth hints, never provenance. It keys a content-enabled run by price source, properties source, catalog, config, policy and executable-code hashes. An existing key is accepted only after the sealed run passes `verify_run.py`; then the supervisor returns `NO_CHANGE` without rerunning matching. Any changed hash receives a new full shadow run and verification. The scheduler interval, overlap policy, retention and alerts remain deployment configuration.
+
 ### 8.1. Self-contained run bundle and batch operator
 
-`run_pilot` captures the exact source, catalog, optional config and optional previous state into `inputs/` before parsing. The parser and catalog loader consume those captured bytes, not mutable external paths. `run-manifest.json` records a content-derived canonical `run_id`, supplier/prefix, input hashes and sizes, policy hash, code-file hashes, feed timestamp and summary identity. `seal.json` covers the manifest and every artifact. The completed files are read-only; this protects against ordinary accidental writes but is not a cryptographic signature or trusted publisher identity.
+`run_pilot` captures the exact source, acquisition metadata, catalog, optional config and optional previous state into `inputs/` before parsing. Content-enabled Netlab runs also capture `GoodsProperties.zip` and its acquisition metadata. The parser and catalog loader consume those captured bytes, not mutable external paths. `run-manifest.json` records a content-derived canonical `run_id`, supplier/prefix, input hashes and sizes, policy hash, code-file hashes, feed timestamps and content summary identity. `seal.json` covers the manifest and every artifact. The completed files are read-only; this protects against ordinary accidental writes but is not a cryptographic signature or trusted publisher identity.
 
 `run_all.py` is the three-supplier read-only operator batch. It runs each supplier independently, verifies each accepted bundle with `verify_run.py`, emits `aggregate.json`, and returns `0` only when every configured supplier passes. Empty, malformed or encoding-inconsistent feeds are `BLOCKED`, not successful no-op runs. State promotion is local and explicit (`--state-root --install-state`) and is never a production catalog write.
 
@@ -348,10 +353,9 @@ Alerts fire on fetch failure, stale snapshot, feed shrinkage, identifier duplica
 ## Current blockers before any price publication
 
 1. Accept fresh, complete source snapshots for Electrozone and Vetcom; the live Netlab supplier snapshot is valid but does not cover the current `31*` catalog scope, so missing actions remain disabled.
-2. Approve an explicit USD→RUB FX source, freshness rule and proposal binding. The current Netlab price result is blocked by currency; the supplier-rate what-if is not publication authority.
-3. Confirm the effective storefront price source, including active specials and customer-group prices; the current preview compares only the catalog base price.
-4. Approve the remaining stock/lifecycle policy over consecutive successful runs; incomplete-feed previews do not authorize stock or status changes.
-5. Review Netlab `5,303` conflicts and `75` ambiguous matches plus the existing Electrozone/Vetcom conflicts; source-only/category proposals remain review-only.
-6. Obtain a valid independent adversarial review of the changed pricing path; the latest attempt ended with provider `429`, so no independent PASS is claimed.
-7. Run multiple consecutive live shadow snapshots after feed acceptance.
-8. Build and separately approve a narrow catalog publisher with backup, read-back and rollback flow.
+2. Confirm the effective storefront price source, including active specials and customer-group prices; the current preview compares only the catalog base price.
+3. Approve the remaining stock/lifecycle policy over consecutive successful runs; incomplete-feed previews do not authorize stock or status changes.
+4. Review Netlab `5,300` conflicts and `75` ambiguous matches plus the existing Electrozone/Vetcom conflicts; source-only/category proposals remain review-only.
+5. Complete independent adversarial review of the changed acquisition, pricing and refresh path.
+6. Run multiple consecutive live shadow snapshots across normal supplier updates and define alert/retention/overlap operations.
+7. Build and separately approve a narrow catalog publisher with backup, read-back and rollback flow.

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run mks123 Netlab read-only content shadow every 15 minutes
+Requires=mks123-netlab-shadow.service
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=30s
+Unit=mks123-netlab-shadow.service
+
+[Install]
+WantedBy=timers.target

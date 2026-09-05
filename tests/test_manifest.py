@@ -37,10 +37,22 @@ def test_run_contains_self_contained_input_manifest(tmp_path: Path) -> None:
     assert manifest["inputs"]["source"]["bundle_path"] == "inputs/source.yml"
     assert manifest["inputs"]["catalog"]["bundle_path"] == "inputs/catalog.csv"
     assert manifest["inputs"]["config"]["bundle_path"] == "inputs/config.yaml"
+    assert manifest["diagnostics"] == {
+        "source_path": "inputs/source.yml",
+        "catalog_path": "inputs/catalog.csv",
+        "config_path": "inputs/config.yaml",
+    }
     assert manifest["inputs"]["source"]["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert manifest["inputs"]["catalog"]["sha256"] == hashlib.sha256(catalog.read_bytes()).hexdigest()
     assert manifest["inputs"]["config"]["sha256"] == hashlib.sha256(config.read_bytes()).hexdigest()
     assert manifest["policy"]["vat_basis"] == "unknown"
+    code_files = manifest["code_identity"]["files"]
+    assert "mks123_pipeline/config.py" in code_files
+    assert "mks123_pipeline/legacy_xml.py" in code_files
+    assert "mks123_pipeline/verifier.py" in code_files
+    assert "fsspec" in manifest["code_identity"]["runtime"]["dependencies"]
+    code_hash = manifest["code_identity"]["sha256"]
+    assert f"-code-{code_hash[:12]}" in manifest["canonical_run_id"]
     assert manifest["summary"]["source_items"] == summary["source_items"]
     seal = json.loads((run_dir / "seal.json").read_text(encoding="utf-8"))
     assert "run-manifest.json" in seal["files"]

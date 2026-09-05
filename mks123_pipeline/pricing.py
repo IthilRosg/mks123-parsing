@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .matcher import MatchRecord
 from .models import SupplierItem
 
 
 class ExchangeRate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     currency: str
     rub_per_unit: Decimal
     source: str
     observed_at: str
+    approved: bool = False
+    supplier_id: str | None = None
+    source_sha256: str | None = None
 
 
 class MarkupRule(BaseModel):
@@ -30,6 +36,13 @@ class PricingContext(BaseModel):
     rule: MarkupRule | None
     max_delta_pct: Decimal = Decimal("0.50")
     vat_basis: Literal["included", "excluded", "unknown"] = "unknown"
+
+    @model_validator(mode="after")
+    def validate_rate_keys(self) -> PricingContext:
+        for currency, rate in self.rates.items():
+            if currency != rate.currency:
+                raise ValueError("rate map key must equal ExchangeRate.currency")
+        return self
 
 
 class PriceProposal(BaseModel):
@@ -70,13 +83,22 @@ def build_proposal(item: SupplierItem, match: MatchRecord, current_price: Decima
         return _blocked(item, match, current_price, "blocked_match", "match_not_exact")
     if item.source_price <= 0:
         return _blocked(item, match, current_price, "blocked_source_price", "nonpositive_source_price")
-    if item.currency not in {"RUB", "RUR"}:
-        return _blocked(item, match, current_price, "blocked_currency", "currency_not_approved")
     rate = context.rates.get(item.currency)
     if rate is None or rate.rub_per_unit <= 0:
         return _blocked(item, match, current_price, "blocked_currency", "missing_or_invalid_exchange_rate")
-    if rate.rub_per_unit != Decimal(1):
-        return _blocked(item, match, current_price, "blocked_currency", "currency_parity_not_approved")
+    if item.currency in {"RUB", "RUR"}:
+        if rate.rub_per_unit != Decimal(1):
+            return _blocked(item, match, current_price, "blocked_currency", "currency_parity_not_approved")
+    elif not (
+        item.supplier == "netlab"
+        and item.currency == "USD"
+        and rate.approved
+        and rate.source == "supplier_feed"
+        and rate.supplier_id == item.supplier
+        and rate.source_sha256 is not None
+        and re.fullmatch(r"[0-9a-f]{64}", rate.source_sha256)
+    ):
+        return _blocked(item, match, current_price, "blocked_currency", "currency_not_approved")
     if context.vat_basis == "unknown":
         return _blocked(item, match, current_price, "blocked_vat_basis", "vat_basis_unknown")
     if context.rule is None or not context.rule.approved:

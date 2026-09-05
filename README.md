@@ -9,10 +9,10 @@ The critical path is supplier catalog ingestion. The production scope has three 
 | Supplier | Catalog SKU prefix | Adapter | Observed source format | Read-only status |
 |---|---:|---|---|---|
 | Electrozone | `11` | `ElectrozoneAdapter` | supplier YML/XML | current supplier URL returns `401`; previous pilot only |
-| Netlab | `31` | `NetlabAdapter` | supplier `pricexml4.zip` / `xml_catalog` | live supplier-owned run accepted; USD FX blocked |
+| Netlab | `31` | `NetlabAdapter` | supplier `pricexml4.zip` / `GoodsProperties.zip` | live fetch, supplier USD rate and verified shadow cycle accepted |
 | Vetcom (ВТК) | `41` | `VetcomAdapter` | supplier B2B export pending | supplier-owned B2B found; no public XML/export endpoint |
 
-Netlab and Vetcom profiles are available as `config/netlab.yaml` and `config/vetcom.yaml`. A profile selects an adapter through the fail-closed factory; it does not enable pricing, registry promotion or publication.
+Netlab and Vetcom profiles are available as `config/netlab.yaml` and `config/vetcom.yaml`. A profile selects an adapter through the fail-closed factory. Netlab additionally enables its approved supplier-feed FX policy; no profile enables registry promotion or publication.
 
 Registry enrichment is an optional, non-blocking branch. The current pilot keeps it disabled in `config/pilot.yaml`; a supplier phrase such as `реестр` or `Минпромторг` creates only an internal review signal. The visible secondary category `Реестровое оборудование` requires exact primary PP-878 evidence and is never populated from a supplier label or an unverified registry export.
 
@@ -23,17 +23,17 @@ Each site-specific adapter exposes `supplier_id`, `catalog_sku_prefix` and `pars
 ## Current guarantees
 
 - Production writes do not exist in this package.
-- Raw YML/XML is content-addressed and retained locally with SHA-256 metadata; every run first captures source/catalog/config/state inputs into its own bundle, verifies byte-for-byte read-back, and seals the complete bundle. Completed artifact files are marked read-only; the seal is an integrity/checksum boundary, not a cryptographic signature.
+- Raw YML/XML/ZIP is content-addressed and retained locally with SHA-256 metadata; every run first captures source/catalog/config/state inputs into its own bundle, verifies byte-for-byte read-back, and seals the complete bundle. Completed artifact files are marked read-only; the seal is an integrity/checksum boundary, not a cryptographic signature.
 - Feed dates are accepted only as `YYYY-MM-DD HH:MM` and cannot influence paths outside `raw/`.
 - XML is parsed with `defusedxml`; one bounded byte read supplies both XML parsing and the recorded source SHA-256, removing separate stat/open and parse/hash races.
 - Electrozone acquisition is included as a direct allowlisted HTTPS Basic Auth connector. It uses bounded downloads, rejects redirects and HTML responses, validates YML before installation and stores the accepted source as an immutable snapshot.
 - The PowerShell wrapper resolves the Electrozone feed credential from the current user's DPAPI store. Credentials are inherited by the connector only for the child process and must not be stored in Git, YAML, argv or reports.
 - Each adapter maps its supplier offer ID to its own catalog SKU prefix: Electrozone `11 + offer_id`, Netlab `31 + offer_id`, Vetcom `41 + offer_id`.
-- Netlab accepts the supplier-owned `pricexml4.zip` boundary, preserves `uid`, `PN`, `GTIN`, all `priceR`…`priceF` levels, URLs, images and raw fields; `priceE` remains the configured source-price level. Documented `count=* / ** / ***` values are availability signals, not numeric quantities. `GoodsProperties.zip` is parsed by a separate streaming, review-aware template.
+- Netlab accepts the supplier-owned `pricexml4.zip` boundary, preserves `uid`, `PN`, `GTIN`, all `priceR`…`priceF` levels, URLs, images and raw fields; `priceE` remains the configured source-price level. The price offer `<uid>` is the only join key for `GoodsProperties.item.@id`; `offer/@id` is never used for content enrichment. `GoodsProperties.zip` is parsed by a separate streaming, review-aware template. Enriched rows retain sanitized `description`, source `description_html`, structured properties and source-hash provenance; unknown properties remain review-only.
 - Vetcom preserves full descriptions, repeated pictures and repeated barcodes. Multiple distinct barcodes remain ambiguous (`ean=null`) rather than selecting one; a non-positive quantity is retained but normalized as unavailable.
 - Exact SKU is primary. Unique EAN and unique manufacturer+model are review signals only.
 - Duplicate identities, conflicting populated EAN/model/manufacturer and ambiguous matches cannot become price proposals.
-- Approved price-preview policy: `site_price = supplier_price × 1.10`; supplier price already includes VAT, and the preview applies no extra VAT step, fixed cost, minimum-margin rule or rounding. RUR/RUB use explicit parity `1`; non-RUB and non-parity rates are blocked by the current policy.
+- Approved price-preview policy: `site_price_rub = supplier_price × rub_per_unit × 1.10`; supplier price already includes VAT, and the preview applies no extra VAT step, fixed cost, minimum-margin rule or rounding. RUR/RUB use explicit parity `1`. Netlab USD uses only the USD→RUB rate embedded in the same accepted supplier ZIP, bounded to `40…200`, bound to its SHA-256/date and accepted only from a feed no older than 24 hours.
 - CSV exports neutralize spreadsheet formulas; unmodified normalized provenance is retained as JSONL.
 - The validated YAML config enforces read-only publication and the selected adapter's SKU scope.
 - The catalog CSV is read once into memory; matching and the recorded catalog SHA-256 use those exact same bytes.
@@ -72,6 +72,27 @@ uv run python scripts/import_manual_drop.py `
 
 The importer leaves the supplied file untouched, copies it through a size-bounded temporary file, verifies its hash and YML structure, and installs an immutable snapshot under `raw/` with `source=manual_drop`. It never invokes matching, publication, or a production database writer. The default acceptance floor is 1,500 offers; overriding it is intended only for tests or a separately approved supplier contract.
 
+### Netlab live shadow and fast price refresh
+
+Fetch the two supplier-owned ZIP files without credentials or production access:
+
+```powershell
+.\scripts\run_fetch_netlab_current.ps1 -Kind all -RawRoot "D:\local\netlab-raw"
+```
+
+For scheduled price refresh, use the SHA-gated supervisor with an explicit catalog snapshot:
+
+```powershell
+uv run python scripts/run_netlab_shadow.py `
+  --catalog "D:\local\catalog-products.csv" `
+  --raw-root "D:\local\netlab-raw" `
+  --runs-root "D:\local\netlab-runs"
+```
+
+The supervisor first performs allowlisted conditional GETs for both `pricexml4.zip` and `GoodsProperties.zip`. Each `304` is accepted only after the local ZIP passes size/SHA/freshness validation and has an append-only receipt; validators are never provenance. It then keys a content-enabled run by price source, properties source, catalog, config, policy and executable-code hashes. An existing key is accepted only after the sealed run passes `verify_run.py`; then it returns `NO_CHANGE` without rerunning matching. Any changed hash creates a complete new run and invokes `verify_run.py`; it never reuses stale matches. The supervisor keeps publication disabled and never writes the production catalog.
+
+The accepted Netlab formula is `priceE (USD) × USD/RUB rate from the same ZIP × 1.10`. The feed timestamp is interpreted as Moscow time; a price ZIP older than 24 hours or more than 15 minutes in the future is rejected. No external or cached FX fallback is used.
+
 ### Proposal generation
 
 ```bash
@@ -84,6 +105,8 @@ uv run python run_pilot.py \
 ```
 
 For another supplier, use the matching profile, for example `--config config/netlab.yaml` or `--config config/vetcom.yaml`. The source snapshot must be supplied separately; a failed/empty/malformed live fetch never replaces a last-known-good snapshot. The fresh Netlab evidence is documented in `verification/reports/NETLAB_PROVIDER_LIVE_RESULT_2026-09-04.md`.
+
+For Netlab, `--source-metadata` is mandatory and `--properties`, `--properties-metadata` enable the full content contract; the supervisor always supplies all four sealed inputs. `--properties-fetched-at` is kept separate because the two supplier snapshots can be acquired at different instants.
 
 ### Three-supplier batch
 
@@ -122,7 +145,10 @@ uv run python -m pytest -q
 ## Output contract
 
 ```text
-inputs/source.<feed-suffix>
+inputs/source.zip
+inputs/source-metadata.json
+inputs/properties.zip (content-enabled Netlab runs)
+inputs/properties-metadata.json (content-enabled Netlab runs)
 inputs/catalog.csv
 inputs/config.yaml (when supplied)
 inputs/previous-state.json (when supplied)
