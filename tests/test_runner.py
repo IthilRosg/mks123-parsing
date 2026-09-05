@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -18,6 +19,13 @@ from mks123_pipeline import runner
 from mks123_pipeline.models import SupplierItem, SupplierSnapshot
 from mks123_pipeline.pricing import ExchangeRate, MarkupRule, PricingContext
 from mks123_pipeline.runner import run_pilot
+
+
+def test_runner_reservation_has_platform_specific_lock_paths() -> None:
+    source = inspect.getsource(runner)
+    assert "if os.name == \"nt\":" in source
+    assert "msvcrt.locking" in source
+    assert "fcntl.flock" in source
 
 
 def test_existing_output_directory_is_never_deleted(tmp_path: Path) -> None:
