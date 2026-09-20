@@ -5,10 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=30min
 User=zenit
 Group=zenit
 WorkingDirectory=/opt/mks123/supplier-pipeline
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/mks123/supplier-pipeline
 ExecStart=/opt/mks123/supplier-pipeline/.venv/bin/python /opt/mks123/supplier-pipeline/scripts/run_netlab_shadow.py --catalog /var/lib/mks123-netlab-shadow/catalog-products.csv --config /opt/mks123/supplier-pipeline/config/netlab.yaml --raw-root /var/lib/mks123-netlab-shadow/raw --runs-root /var/lib/mks123-netlab-shadow/runs
 NoNewPrivileges=true
 PrivateTmp=true

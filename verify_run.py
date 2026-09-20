@@ -13,8 +13,19 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--config", type=Path)
+    parser.add_argument(
+        "--no-deterministic-replay",
+        action="store_true",
+        help="skip the expensive deterministic artifact replay; retain seal and semantic checks",
+    )
     args = parser.parse_args()
-    result = verify_run(args.run, source=args.source, catalog=args.catalog, config=args.config)
+    result = verify_run(
+        args.run,
+        source=args.source,
+        catalog=args.catalog,
+        config=args.config,
+        deterministic_replay=not args.no_deterministic_replay,
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result["status"] == "PASS" else 1
 

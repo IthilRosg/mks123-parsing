@@ -184,16 +184,27 @@ def _run_reservation(lock_path: Path, timeout: float = 30.0):
 
 
 def _remove_tree(path: Path) -> None:
-    def onerror(function: Any, failed_path: str, exc_info: Any) -> None:
-        if os.path.islink(failed_path):
-            os.unlink(failed_path)
+    def make_writable(candidate: str | Path) -> None:
+        candidate_path = Path(candidate)
+        if candidate_path.is_symlink():
             return
-        os.chmod(failed_path, stat.S_IREAD | stat.S_IWRITE)
+        mode = stat.S_IREAD | stat.S_IWRITE
+        if candidate_path.is_dir():
+            mode |= stat.S_IEXEC
+        try:
+            os.chmod(candidate_path, mode)
+        except OSError:
+            pass
+
+    def onerror(function: Any, failed_path: str, exc_info: Any) -> None:
+        make_writable(Path(failed_path).parent)
+        make_writable(failed_path)
         function(failed_path)
 
     if path.is_symlink():
         path.unlink(missing_ok=True)
     elif path.is_dir():
+        make_writable(path)
         shutil.rmtree(path, onerror=onerror)
     else:
         path.unlink(missing_ok=True)

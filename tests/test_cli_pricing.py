@@ -51,6 +51,7 @@ def _write_netlab_metadata(
     return path
 
 
+@pytest.mark.skipif(os.name == "nt", reason="sealed-run CLI requires POSIX directory freeze")
 def test_cli_passes_approved_simple_pricing_policy_to_read_only_runner(tmp_path: Path) -> None:
     source = tmp_path / "source.yml"
     source.write_text(

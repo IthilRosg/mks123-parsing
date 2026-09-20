@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from io import BytesIO
@@ -8,7 +9,9 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import duckdb
+import pytest
 
+from mks123_pipeline import verifier as verifier_module
 from mks123_pipeline.adapters import NetlabAdapter
 from mks123_pipeline.config import load_pilot_config, pricing_context_from_config
 from mks123_pipeline.db_digest import database_content_sha256
@@ -175,6 +178,30 @@ def test_generic_verifier_rejects_changed_external_input(tmp_path: Path) -> None
     assert manifest["inputs"]["source"]["bundle_path"] == "inputs/source.yml"
 
 
+def test_verifier_can_skip_deterministic_replay_only_when_explicitly_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, source, catalog, config = _make_run(tmp_path)
+
+    def unexpected_replay(*args: object, **kwargs: object) -> tuple[bool, str]:
+        raise AssertionError("deterministic replay must be explicit in the supervisor profile")
+
+    monkeypatch.setattr(verifier_module, "_netlab_artifact_reconciliation", unexpected_replay)
+
+    result = verifier_module.verify_run(
+        run_dir,
+        source=source,
+        catalog=catalog,
+        config=config,
+        deterministic_replay=False,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["checks"]["netlab_artifact_reconciliation"]["detail"] == "replay_skipped"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sealed-run verifier CLI requires POSIX descriptors")
 def test_generic_verifier_cli_returns_pass_for_valid_run(tmp_path: Path) -> None:
     run_dir, source, catalog, config = _make_run(tmp_path)
     project = Path(__file__).parents[1]
@@ -355,6 +382,7 @@ publication: {enabled: false}
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    run_dir.chmod(0o700)
     seal_path = run_dir / "seal.json"
     seal_path.chmod(0o600)
     seal_path.unlink()
@@ -379,6 +407,7 @@ def test_verifier_rejects_unknown_feed_completeness_status(tmp_path: Path) -> No
     manifest["summary"]["feed_completeness"] = summary["feed_completeness"]
     manifest_path.chmod(0o600)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run_dir.chmod(0o700)
     seal_path = run_dir / "seal.json"
     seal_path.chmod(0o600)
     seal_path.unlink()
@@ -422,6 +451,7 @@ def test_verifier_rejects_netlab_semantic_forgery(tmp_path: Path) -> None:
 
     database_path = run_dir / "pilot.duckdb"
     database_path.chmod(0o600)
+    run_dir.chmod(0o700)
     with duckdb.connect(str(database_path)) as db:
         db.execute("update matches set catalog_product_id = '102' where supplier_item_id = '1000463'")
         db.execute("update proposals set product_id = '102' where supplier_item_id = '1000463'")
@@ -438,6 +468,7 @@ def test_verifier_rejects_netlab_semantic_forgery(tmp_path: Path) -> None:
     manifest["summary"]["duckdb_content_sha256"] = database_digest
     manifest_path.chmod(0o600)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run_dir.chmod(0o700)
     seal_path = run_dir / "seal.json"
     seal_path.chmod(0o600)
     seal_path.unlink()

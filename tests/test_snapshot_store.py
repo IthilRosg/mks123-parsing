@@ -225,6 +225,7 @@ def test_target_publish_readback_failure_removes_new_snapshot_and_metadata(
     assert list(tmp_path.glob("electrozone-live-*.metadata.json")) == []
 
 
+@pytest.mark.skipif(os.name != "nt" and os.geteuid() == 0, reason="root bypasses POSIX write-permission checks")
 def test_published_manifest_is_readonly_and_uses_no_hardlink_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -383,7 +384,7 @@ def test_failed_install_with_metadata_directory_cleans_new_target(
     sentinel = metadata_path / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
 
-    with pytest.raises((OSError, RuntimeError)):
+    with pytest.raises((OSError, RuntimeError, ValueError)):
         install_snapshot(
             _part(tmp_path, ".source.part", payload),
             tmp_path,

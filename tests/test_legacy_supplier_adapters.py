@@ -8,6 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
+from mks123_pipeline import legacy_xml
 from mks123_pipeline.adapters import NetlabAdapter, VetcomAdapter, create_adapter
 from mks123_pipeline.electrozone import FeedValidationError
 from mks123_pipeline.runner import run_pilot
@@ -57,6 +58,30 @@ NETLAB_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
         <GTIN>04601004138230</GTIN>
       </offer>
     </offers>
+  </shop>
+</xml_catalog>
+"""
+
+
+STREAMING_ORDER_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<xml_catalog date="2026-03-12 16:39">
+  <shop>
+    <offers>
+      <offer id="1000463" available="true">
+        <uid>11000463</uid><priceE>270</priceE><currencyId>USD</currencyId><categoryId>10</categoryId>
+        <name>First <b>nested</b></name>
+        <picture>https://img.example/one.jpg</picture><picture>https://img.example/two.jpg</picture>
+        <param name="dup"></param><param name="dup">second</param>
+      </offer>
+      <offer id="1000464" available="false">
+        <uid>11000464</uid><priceE>280</priceE><currencyId>USD</currencyId><categoryId>10</categoryId>
+        <name>Second</name>
+      </offer>
+    </offers>
+    <categories>
+      <category id="1">Root</category><category id="10" parentId="1">Leaf</category>
+    </categories>
+    <currencies><currency id="USD" rate="1" /></currencies>
   </shop>
 </xml_catalog>
 """
@@ -131,6 +156,207 @@ def _write_feed(tmp_path: Path, name: str, content: str) -> Path:
     path = tmp_path / name
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def test_legacy_parser_enforces_offer_bound_without_building_full_xml_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_feed(
+        tmp_path,
+        "too-many.xml",
+        NETLAB_FIXTURE.replace(
+            "      </offer>\n    </offers>",
+            "      </offer>\n      <offer id=\"1000464\" available=\"true\">"
+            "<priceE>2</priceE><currencyId>USD</currencyId><name>Second</name>"
+            "<uid>11000464</uid></offer>\n    </offers>",
+        ),
+    )
+    original_fromstring = legacy_xml.ET.fromstring
+
+    def fail_full_tree(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("legacy parser materialized the complete XML tree")
+
+    monkeypatch.setattr(legacy_xml.ET, "fromstring", fail_full_tree)
+    with pytest.raises(FeedValidationError, match="offer count exceeds maximum"):
+        NetlabAdapter().parse(
+            source,
+            fetched_at="2026-03-12T16:40:00Z",
+            min_items=1,
+            max_items=1,
+            max_bytes=64 * 1024,
+        )
+    assert original_fromstring is not legacy_xml.ET.fromstring
+
+
+
+def test_legacy_parser_preserves_offer_tail_in_raw_hash(tmp_path: Path) -> None:
+    source = _write_feed(tmp_path, "tail.xml", NETLAB_FIXTURE)
+    snapshot = NetlabAdapter().parse(
+        source,
+        fetched_at="2026-03-12T16:40:00Z",
+        min_items=1,
+        max_items=10,
+        max_bytes=64 * 1024,
+    )
+    root = legacy_xml.ET.fromstring(source.read_bytes())
+    expected_offer = root.find("./shop/offers/offer")
+    assert expected_offer is not None
+    expected_hash = hashlib.sha256(legacy_xml.ET.tostring(expected_offer, encoding="utf-8")).hexdigest()
+    assert snapshot.items[0].raw_hash == expected_hash
+
+
+
+@pytest.mark.parametrize(
+    ("date_attribute", "expected_date"),
+    [
+        (' date="2026-03-12 16:39"', "2026-03-12 16:39"),
+        (' date=" d "', " d "),
+        (' date=""', ""),
+        ("", None),
+    ],
+)
+def test_legacy_parser_preserves_catalog_date_attribute_verbatim(
+    tmp_path: Path,
+    date_attribute: str,
+    expected_date: str | None,
+) -> None:
+    source = _write_feed(
+        tmp_path,
+        "date.xml",
+        NETLAB_FIXTURE.replace(' date="2026-03-12 16:39"', date_attribute, 1),
+    )
+
+    snapshot = NetlabAdapter().parse(
+        source,
+        fetched_at="2026-03-12T16:40:00Z",
+        min_items=1,
+        max_items=10,
+        max_bytes=64 * 1024,
+    )
+
+    assert snapshot.catalog_date == expected_date
+
+
+def test_legacy_parser_handles_late_containers_and_consecutive_offer_tails(tmp_path: Path) -> None:
+    source = _write_feed(tmp_path, "late-containers.xml", STREAMING_ORDER_FIXTURE)
+    snapshot = NetlabAdapter().parse(
+        source,
+        fetched_at="2026-03-12T16:40:00Z",
+        min_items=1,
+        max_items=10,
+        max_bytes=64 * 1024,
+    )
+
+    root = legacy_xml.ET.fromstring(source.read_bytes())
+    expected_offers = root.findall("./shop/offers/offer")
+    expected_hashes = [
+        hashlib.sha256(legacy_xml.ET.tostring(offer, encoding="utf-8")).hexdigest()
+        for offer in expected_offers
+    ]
+    assert [item.raw_hash for item in snapshot.items] == expected_hashes
+    assert [item.category_path for item in snapshot.items] == [["Root", "Leaf"], ["Root", "Leaf"]]
+    assert snapshot.items[0].name == "First nested"
+    assert snapshot.items[0].image_urls == [
+        "https://img.example/one.jpg",
+        "https://img.example/two.jpg",
+    ]
+    assert snapshot.items[0].attributes["param:dup"] == ""
+    assert snapshot.items[0].attributes["param:dup#2"] == "second"
+
+
+def test_legacy_parser_does_not_count_nested_offer_lookalike(tmp_path: Path) -> None:
+    source = _write_feed(
+        tmp_path,
+        "nested-offer.xml",
+        STREAMING_ORDER_FIXTURE.replace(
+            "<name>First <b>nested</b></name>",
+            "<name>Before<offer><b>inside</b></offer>After</name>",
+        ),
+    )
+
+    snapshot = NetlabAdapter().parse(
+        source,
+        fetched_at="2026-03-12T16:40:00Z",
+        min_items=1,
+        max_items=2,
+        max_bytes=64 * 1024,
+    )
+
+    assert len(snapshot.items) == 2
+    assert snapshot.items[0].name == "BeforeinsideAfter"
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (
+            "</categories><categories><category id=\"11\">Other</category></categories>",
+            "expected at most one categories",
+        ),
+        (
+            "</currencies><currencies><currency id=\"RUR\" rate=\"1\" /></currencies>",
+            "expected exactly one currencies",
+        ),
+    ],
+)
+def test_legacy_parser_rejects_duplicate_structural_containers(
+    tmp_path: Path,
+    replacement: str,
+    message: str,
+) -> None:
+    content = STREAMING_ORDER_FIXTURE
+    if "categories" in replacement:
+        content = content.replace("</categories>", replacement, 1)
+    else:
+        content = content.replace("</currencies>", replacement, 1)
+    source = _write_feed(tmp_path, "duplicate-container.xml", content)
+
+    with pytest.raises(FeedValidationError, match=message):
+        NetlabAdapter().parse(
+            source,
+            fetched_at="2026-03-12T16:40:00Z",
+            min_items=1,
+            max_items=10,
+            max_bytes=64 * 1024,
+        )
+
+
+def test_legacy_parser_rejects_duplicate_offer_id(tmp_path: Path) -> None:
+    source = _write_feed(
+        tmp_path,
+        "duplicate-id.xml",
+        STREAMING_ORDER_FIXTURE.replace('id="1000464"', 'id="1000463"', 1),
+    )
+
+    with pytest.raises(FeedValidationError, match="duplicate supplier item id"):
+        NetlabAdapter().parse(
+            source,
+            fetched_at="2026-03-12T16:40:00Z",
+            min_items=1,
+            max_items=10,
+            max_bytes=64 * 1024,
+        )
+
+
+def test_legacy_parser_rejects_malformed_trailing_xml(tmp_path: Path) -> None:
+    source = _write_feed(
+        tmp_path,
+        "malformed-tail.xml",
+        STREAMING_ORDER_FIXTURE.replace("</xml_catalog>", "<broken></xml_catalog>"),
+    )
+
+    with pytest.raises(FeedValidationError, match="invalid XML feed"):
+        NetlabAdapter().parse(
+            source,
+            fetched_at="2026-03-12T16:40:00Z",
+            min_items=1,
+            max_items=10,
+            max_bytes=64 * 1024,
+        )
+
+
 
 
 def test_netlab_adapter_maps_real_feed_fields_and_legacy_price_column(tmp_path: Path) -> None:

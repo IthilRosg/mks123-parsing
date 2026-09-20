@@ -30,6 +30,8 @@ verification/
 
 # Local operator scratch
 .ops-tmp/
+.hermes/
+nul
 *.tmp
 *.part
 

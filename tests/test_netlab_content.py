@@ -16,6 +16,7 @@ from mks123_pipeline.netlab_acquisition import (
 )
 from mks123_pipeline.netlab_content import (
     _safe_image_url,
+    build_short_source_description,
     enrich_netlab_snapshot,
     sanitize_supplier_html,
 )
@@ -92,6 +93,13 @@ def test_netlab_enrichment_binds_uid_and_sanitizes_content(tmp_path: Path) -> No
     assert result.uid_properties_overlap == 1
     assert result.description_items == 1
     assert result.unknown_property_id_count == 1
+
+
+def test_build_short_source_description_falls_back_to_name_for_full_specs() -> None:
+    long_description = "<p>Overview</p><p>Details</p><ul><li>DDR5: 32 GB</li><li>Speed: 4800</li><li>CL: 40</li></ul>"
+    assert build_short_source_description("CBR DDR5 32GB", long_description) == "CBR DDR5 32GB"
+    assert build_short_source_description("Product", "<p>Short source text</p>") == "<p>Short source text</p>"
+    assert build_short_source_description("Product", None) is None
 
 
 def test_safe_image_url_rejects_malformed_urls_without_raising() -> None:

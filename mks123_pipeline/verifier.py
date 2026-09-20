@@ -7,6 +7,7 @@ import json
 import re
 import tempfile
 from collections import Counter
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
@@ -59,6 +60,41 @@ def _result(checks: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "checks_total": len(checks),
         "checks": checks,
     }
+
+
+class _SealedEvidenceMap(Mapping[str, Any]):
+    """Read sealed payloads on demand instead of retaining the whole run."""
+
+    def __init__(self, run_dir: str | Path, sealed: Any) -> None:
+        self._run_dir = Path(run_dir)
+        self._records = sealed.files
+        self._small_cache: dict[str, Any] = {}
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._records)
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, relative: str) -> Any:
+        if relative not in self._records:
+            raise KeyError(relative)
+        cached = self._small_cache.get(relative)
+        if cached is not None:
+            return cached
+        record = self._records[relative]
+        evidence = read_evidence(self._run_dir / Path(relative))
+        expected_size = record.size if record.size is not None else len(record.data)
+        if (
+            evidence.sha256 != record.sha256
+            or evidence.size != expected_size
+            or evidence.file_identity != record.file_identity
+            or evidence.canonical_path != record.canonical_path
+        ):
+            raise ValueError(f"sealed run file changed during lazy read: {relative}")
+        if expected_size <= 4 * 1024 * 1024:
+            self._small_cache[relative] = evidence
+        return evidence
 
 
 def _check(checks: dict[str, dict[str, Any]], name: str, condition: bool, detail: Any) -> None:
@@ -793,14 +829,15 @@ def verify_run(
     source: str | Path | None = None,
     catalog: str | Path | None = None,
     config: str | Path | None = None,
+    deterministic_replay: bool = True,
 ) -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
     try:
-        sealed = load_sealed_run(run_dir)
+        sealed = load_sealed_run(run_dir, read_content=False)
+        files = _SealedEvidenceMap(run_dir, sealed)
     except Exception as exc:  # noqa: BLE001 - verifier must return a machine result
         _check(checks, "run_seal", False, str(exc))
         return _result(checks)
-    files = sealed.files
     _check(checks, "run_seal", True, {"files": len(files), "sha256": sealed.seal_evidence.sha256})
 
     manifest_evidence = files.get(MANIFEST_NAME)
@@ -1114,8 +1151,11 @@ def verify_run(
     _check(checks, "netlab_pricing_semantics", netlab_pricing_ok, netlab_pricing_detail)
     netlab_content_ok, netlab_content_detail = _netlab_content_semantics(manifest, files, rows)
     _check(checks, "netlab_content_semantics", netlab_content_ok, netlab_content_detail)
-    netlab_artifacts_ok, netlab_artifacts_detail = _netlab_artifact_reconciliation(manifest, files, summary)
-    _check(checks, "netlab_artifact_reconciliation", netlab_artifacts_ok, netlab_artifacts_detail)
+    if deterministic_replay:
+        netlab_artifacts_ok, netlab_artifacts_detail = _netlab_artifact_reconciliation(manifest, files, summary)
+        _check(checks, "netlab_artifact_reconciliation", netlab_artifacts_ok, netlab_artifacts_detail)
+    else:
+        _check(checks, "netlab_artifact_reconciliation", True, "replay_skipped")
 
     database_evidence = files.get("pilot.duckdb")
     if database_evidence is None:

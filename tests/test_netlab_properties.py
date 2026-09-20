@@ -6,6 +6,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
+from mks123_pipeline import netlab_properties
 from mks123_pipeline.electrozone import FeedValidationError
 from mks123_pipeline.netlab_properties import scan_netlab_properties
 
@@ -33,6 +34,91 @@ def _write_source(tmp_path: Path, text: str) -> Path:
     source = tmp_path / "GoodsProperties.xml"
     source.write_bytes(text.encode("cp1251"))
     return source
+
+
+def test_scan_netlab_properties_rejects_observations_before_item_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_source(tmp_path, PROPERTIES_FIXTURE)
+
+    class FakeElement:
+        def __init__(
+            self,
+            tag: str,
+            *,
+            attrib: dict[str, str] | None = None,
+            text: str = "",
+            children: list[FakeElement] | None = None,
+            reject_iteration: bool = False,
+        ) -> None:
+            self.tag = tag
+            self.attrib = attrib or {}
+            self.text = text
+            self.children = children or []
+            self.reject_iteration = reject_iteration
+
+        def __iter__(self):
+            if self.reject_iteration:
+                raise AssertionError("item children were materialized before the bound check")
+            return iter(self.children)
+
+        def itertext(self):
+            return iter([self.text])
+
+        def clear(self) -> None:
+            return None
+
+    root = FakeElement("xml_catalog", attrib={"date": "2026-09-04 08:46"})
+    properties = FakeElement("properties")
+    definition = FakeElement("property", attrib={"id": "p1"}, text="Property")
+    items = FakeElement("items")
+    first = FakeElement("p1", text="first")
+    second = FakeElement("p2", text="second")
+    item = FakeElement("item", attrib={"id": "100"}, children=[first, second], reject_iteration=True)
+    events = [
+        ("start", root),
+        ("start", properties),
+        ("start", definition),
+        ("end", definition),
+        ("end", properties),
+        ("start", items),
+        ("start", item),
+        ("start", first),
+        ("end", first),
+        ("start", second),
+        ("end", second),
+        ("end", item),
+    ]
+    monkeypatch.setattr(netlab_properties.ET, "iterparse", lambda *_args, **_kwargs: iter(events))
+
+    with pytest.raises(FeedValidationError, match="observation count exceeds maximum"):
+        netlab_properties.scan_netlab_properties(
+            source,
+            max_bytes=64 * 1024,
+            max_observations=1,
+        )
+
+
+
+def test_scan_netlab_properties_does_not_count_nested_item_markup_before_structure_error(
+    tmp_path: Path,
+) -> None:
+    source = _write_source(
+        tmp_path,
+        PROPERTIES_FIXTURE.replace(
+            "<p1>ACME</p1>",
+            "<p1><item><b>ACME</b></item></p1>",
+        ),
+    )
+
+    with pytest.raises(FeedValidationError, match="item must be a direct child of items"):
+        scan_netlab_properties(
+            source,
+            max_bytes=64 * 1024,
+            max_observations=1,
+        )
+
 
 
 def test_scan_netlab_properties_streams_definitions_and_items(tmp_path: Path) -> None:
@@ -107,6 +193,53 @@ def test_scan_netlab_properties_accepts_official_archive_and_seals_archive(tmp_p
 
     assert stats.source_sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
     assert stats.item_count == 2
+
+
+@pytest.mark.parametrize(
+    ("bound", "message"),
+    [
+        ("max_properties", "property definition count exceeds maximum"),
+        ("max_items", "item count exceeds maximum"),
+        ("max_observations", "observation count exceeds maximum"),
+    ],
+)
+def test_scan_netlab_properties_enforces_collection_bounds(
+    tmp_path: Path,
+    bound: str,
+    message: str,
+) -> None:
+    source = _write_source(tmp_path, PROPERTIES_FIXTURE)
+    with pytest.raises(FeedValidationError, match=message):
+        scan_netlab_properties(source, max_bytes=64 * 1024, **{bound: 1})
+
+
+def test_scan_netlab_properties_accepts_exact_collection_bounds(tmp_path: Path) -> None:
+    source = _write_source(tmp_path, PROPERTIES_FIXTURE)
+    stats = scan_netlab_properties(
+        source,
+        max_bytes=64 * 1024,
+        max_properties=2,
+        max_items=2,
+        max_observations=3,
+    )
+    assert stats.property_count == 2
+    assert stats.item_count == 2
+    assert stats.observation_count == 3
+
+
+@pytest.mark.parametrize(
+    "invalid_bound",
+    [0, -1, True, 1.5, "1"],
+)
+@pytest.mark.parametrize("bound", ["max_properties", "max_items", "max_observations"])
+def test_scan_netlab_properties_rejects_invalid_collection_bounds(
+    tmp_path: Path,
+    bound: str,
+    invalid_bound: object,
+) -> None:
+    source = _write_source(tmp_path, PROPERTIES_FIXTURE)
+    with pytest.raises(FeedValidationError, match="parser bound"):
+        scan_netlab_properties(source, max_bytes=64 * 1024, **{bound: invalid_bound})
 
 
 @pytest.mark.parametrize("container", ["properties", "items"])

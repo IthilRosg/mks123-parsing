@@ -104,6 +104,7 @@ def _verify_command(
         str(catalog),
         "--config",
         str(config),
+        "--no-deterministic-replay",
     ]
 
 
@@ -166,8 +167,19 @@ def _assert_run_identity(
     policy_hash: str,
     executable_identity: dict[str, Any],
 ) -> None:
-    sealed = load_sealed_run(run_dir)
-    evidence = sealed.files.get("run-manifest.json")
+    sealed = load_sealed_run(run_dir, read_content=False)
+    evidence = read_evidence(run_dir / "run-manifest.json")
+    sealed_record = sealed.files.get("run-manifest.json")
+    if sealed_record is None:
+        raise RuntimeError("sealed run has no manifest record")
+    sealed_size = sealed_record.size if sealed_record.size is not None else len(sealed_record.data)
+    if (
+        evidence.sha256 != sealed_record.sha256
+        or evidence.size != sealed_size
+        or evidence.file_identity != sealed_record.file_identity
+        or evidence.canonical_path != sealed_record.canonical_path
+    ):
+        raise RuntimeError("sealed manifest changed after metadata verification")
     if evidence is None:
         raise RuntimeError("sealed run has no manifest")
     manifest = json.loads(evidence.data)

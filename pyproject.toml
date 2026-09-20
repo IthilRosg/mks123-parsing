@@ -9,9 +9,13 @@ dependencies = [
     "duckdb==1.5.5",
     "fsspec>=2025.7.0,<2027",
     "pandas==2.3.3",
+    "pillow==12.3.0",
     "pydantic==2.13.5",
     "pyyaml==6.0.3",
 ]
+
+[project.scripts]
+netlab-media = "mks123_pipeline.netlab_media_cli:main"
 
 [build-system]
 requires = ["setuptools>=77"]

@@ -17,6 +17,9 @@ from .integrity import read_evidence
 _PROPERTY_ID_RE = re.compile(r"p[1-9][0-9]*\Z")
 _ITEM_ID_RE = re.compile(r"[1-9][0-9]*\Z")
 _DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}\Z")
+_DEFAULT_MAX_PROPERTIES = 100_000
+_DEFAULT_MAX_ITEMS = 100_000
+_DEFAULT_MAX_OBSERVATIONS = 5_000_000
 
 
 @dataclass(frozen=True)
@@ -89,11 +92,22 @@ def scan_netlab_properties(
     path: str | Path,
     *,
     max_bytes: int = 128 * 1024 * 1024,
+    max_properties: int = _DEFAULT_MAX_PROPERTIES,
+    max_items: int = _DEFAULT_MAX_ITEMS,
+    max_observations: int = _DEFAULT_MAX_OBSERVATIONS,
     emit: Callable[[NetlabPropertyObservation], None] | None = None,
     emit_item: Callable[[str, tuple[NetlabPropertyObservation, ...]], None] | None = None,
     allow_unknown_property_ids: bool = False,
 ) -> NetlabPropertiesStats:
     """Validate and stream the official Netlab GoodsProperties XML."""
+
+    for label, limit in (
+        ("max_properties", max_properties),
+        ("max_items", max_items),
+        ("max_observations", max_observations),
+    ):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise FeedValidationError(f"{label} parser bound must be a positive integer")
 
     source_path = Path(path)
     source_data = _read_source(source_path, max_bytes)
@@ -107,6 +121,7 @@ def scan_netlab_properties(
     property_count = 0
     item_count = 0
     observation_count = 0
+    observation_start_count = 0
     missing_observation_count = 0
     unknown_property_ids: set[str] = set()
     unknown_observation_count = 0
@@ -121,6 +136,10 @@ def scan_netlab_properties(
             if not isinstance(tag, str):
                 raise FeedValidationError("Netlab properties XML contains a non-text element name")
             if event == "start":
+                if len(element_stack) >= 2 and element_stack[-1] == "item" and element_stack[-2] == "items":
+                    observation_start_count += 1
+                    if observation_start_count > max_observations:
+                        raise FeedValidationError("observation count exceeds maximum")
                 if not root_seen:
                     root_seen = True
                     if tag != "xml_catalog":
@@ -144,6 +163,8 @@ def scan_netlab_properties(
                 raise FeedValidationError("Netlab properties XML element ancestry is invalid")
 
             if tag == "property":
+                if property_count >= max_properties:
+                    raise FeedValidationError("property definition count exceeds maximum")
                 property_id = (element.attrib.get("id") or "").strip()
                 name = _node_text(element)
                 if not _PROPERTY_ID_RE.fullmatch(property_id) or property_id == "p0":
@@ -159,6 +180,8 @@ def scan_netlab_properties(
                 property_container_count += 1
                 element.clear()
             elif tag == "item":
+                if item_count >= max_items:
+                    raise FeedValidationError("item count exceeds maximum")
                 item_id = (element.attrib.get("id") or "").strip()
                 if not _ITEM_ID_RE.fullmatch(item_id):
                     raise FeedValidationError(f"invalid Netlab properties item id: {item_id!r}")
@@ -168,6 +191,8 @@ def scan_netlab_properties(
                 seen_property_ids: set[str] = set()
                 item_observations: list[NetlabPropertyObservation] = []
                 for child in list(element):
+                    if observation_count >= max_observations:
+                        raise FeedValidationError("observation count exceeds maximum")
                     property_id = child.tag
                     if not isinstance(property_id, str) or not _PROPERTY_ID_RE.fullmatch(property_id):
                         raise FeedValidationError(

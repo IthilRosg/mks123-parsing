@@ -117,6 +117,27 @@ def sanitize_supplier_html(value: str, *, max_chars: int = 256_000) -> str:
         raise FeedValidationError("sanitized Netlab description exceeds character limit")
     return result
 
+def build_short_source_description(
+    name: str,
+    description_html: str | None,
+    *,
+    max_chars: int = 500,
+) -> str | None:
+    """Keep customer description short; retain full source HTML in provenance."""
+    if description_html is None:
+        return None
+    sanitized = sanitize_supplier_html(description_html)
+    if not sanitized:
+        return None
+    if (
+        len(sanitized) <= max_chars
+        and not re.search(r"<(?:ul|ol|table|li)\b", sanitized, re.IGNORECASE)
+        and sanitized.lower().count("<p") <= 2
+    ):
+        return sanitized
+    summary = sanitize_supplier_html(name)
+    return summary or None
+
 
 def _safe_image_url(value: str) -> bool:
     try:
@@ -217,7 +238,8 @@ def enrich_netlab_snapshot(
         uid_joinable = uid is not None and uid not in duplicate_uids
         property_data = properties_by_uid.get(uid) if uid_joinable and uid is not None else None
         records, description_html = property_data if property_data is not None else ([], None)
-        description = sanitize_supplier_html(description_html) if description_html is not None else None
+        sanitized_source_description = sanitize_supplier_html(description_html) if description_html is not None else None
+        description = build_short_source_description(item.name, description_html)
         if description == "":
             description = None
         if description is not None:
@@ -272,6 +294,11 @@ def enrich_netlab_snapshot(
                 "property_id": _DESCRIPTION_PROPERTY_ID,
                 "item_id": uid,
                 "sanitized": True,
+                "customer_summary_mode": (
+                    "source_description"
+                    if description == sanitized_source_description
+                    else "product_name_fallback"
+                ),
             }
         enriched_items.append(
             item.model_copy(
